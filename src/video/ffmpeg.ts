@@ -4,6 +4,8 @@ import { logger } from '../utils/logger.js';
 
 export interface FFmpegOptions {
   input: string;
+  /** Additional inputs (e.g. background image). */
+  extraInputs?: string[];
   output: string;
   filterComplex?: string;
   outputArgs?: string[];
@@ -15,6 +17,12 @@ export async function runFFmpeg(options: FFmpegOptions): Promise<void> {
     '-y',
     '-i', options.input,
   ];
+
+  if (options.extraInputs) {
+    for (const extra of options.extraInputs) {
+      args.push('-i', extra);
+    }
+  }
 
   if (options.filterComplex) {
     args.push('-filter_complex', options.filterComplex);

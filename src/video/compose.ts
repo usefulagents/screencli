@@ -5,7 +5,7 @@ import { buildHighlightFilters } from './highlight.js';
 import { buildCursorFilter } from './cursor.js';
 import { computeActiveSegments, buildTrimFilter, estimateTrimmedDuration } from './trim.js';
 import { runFFmpeg, getVideoDuration } from './ffmpeg.js';
-import { buildBackgroundFilterComplex, type BackgroundOptions } from './background.js';
+import { buildBackgroundFilterComplex, backgroundImagePath, type BackgroundOptions } from './background.js';
 import { logger } from '../utils/logger.js';
 import { unlinkSync } from 'node:fs';
 
@@ -113,12 +113,14 @@ export async function composeVideo(options: ComposeOptions): Promise<string> {
 
   // Step 3: Apply effects + optional background
   if (options.background) {
-    // Use filter_complex to composite video onto gradient background
+    // Use filter_complex to composite video onto background image
+    const bgImage = backgroundImagePath(options.background.gradient);
     const fc = buildBackgroundFilterComplex(filters, options.viewport, options.background);
     logger.info(`Applying background (${options.background.gradient}) with ${filters.length} effect filters...`);
 
     await runFFmpeg({
       input: currentInput,
+      extraInputs: [bgImage],
       output: options.outputPath,
       filterComplex: fc,
       outputArgs: [

@@ -31,8 +31,8 @@ export const loginOption = new Option('--login', 'Open browser for manual login 
 export const authOption = new Option('--auth <name>', 'Use saved auth state (auto-creates on first use via login flow)');
 
 export const backgroundOption = new Option('--background <name>', 'Background style').choices([
-  'aurora', 'sunset', 'ocean', 'lavender', 'mint', 'ember', 'none',
-]).default('aurora');
+  'midnight', 'ember', 'forest', 'nebula', 'slate', 'copper', 'none',
+]);
 export const noBackgroundOption = new Option('--no-background', 'Disable background');
 export const paddingOption = new Option('--padding <percent>', 'Background padding percentage').default('8');
 export const cornerRadiusOption = new Option('--corner-radius <px>', 'Video corner radius in pixels').default('12');

@@ -36,8 +36,9 @@ import type { BackgroundOptions } from '../../video/background.js';
 import { logger, setLogLevel } from '../../utils/logger.js';
 import { isLoggedIn, apiRequest, validateToken, saveCloudConfig, loadCloudConfig } from '../../cloud/client.js';
 import { uploadRecording } from '../../cloud/upload.js';
+import { BACKGROUND_PRESETS, randomPreset } from '../../video/background.js';
 
-const BACKGROUND_CHOICES = ['aurora', 'sunset', 'ocean', 'lavender', 'mint', 'ember'] as const;
+const BACKGROUND_CHOICES = BACKGROUND_PRESETS;
 
 function ask(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -101,8 +102,11 @@ export const recordCommand = new Command('record')
     }
 
     // Resolve background: --no-background or --background none disables it
+    // Otherwise pick a random preset if not specified
     if (opts.noBackground || opts.background === 'none') {
       opts.background = undefined;
+    } else if (!opts.background) {
+      opts.background = randomPreset();
     }
 
     // Validate cloud token early, before any expensive work

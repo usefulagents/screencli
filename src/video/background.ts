@@ -1,55 +1,28 @@
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
 import type { Viewport } from '../recording/types.js';
 
-export type GradientPreset = 'aurora' | 'sunset' | 'ocean' | 'lavender' | 'mint' | 'ember';
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export const GRADIENT_PRESETS: GradientPreset[] = ['aurora', 'sunset', 'ocean', 'lavender', 'mint', 'ember'];
+export type BackgroundPreset = 'midnight' | 'ember' | 'forest' | 'nebula' | 'slate' | 'copper';
 
-interface GradientDef {
-  r: string;
-  g: string;
-  b: string;
+export const BACKGROUND_PRESETS: BackgroundPreset[] = ['midnight', 'ember', 'forest', 'nebula', 'slate', 'copper'];
+
+/** Pick a random background preset. */
+export function randomPreset(): BackgroundPreset {
+  return BACKGROUND_PRESETS[Math.floor(Math.random() * BACKGROUND_PRESETS.length)]!;
 }
 
-/**
- * Gradient definitions using FFmpeg geq expressions.
- * X/Y = pixel coords, W/H = frame dimensions.
- * Trig functions at varying frequencies/phases produce organic colour blends.
+/** Resolve the absolute path to a background image.
+ *  At runtime __dirname is dist/video/, so we go up 3 levels to the project root.
  */
-const gradients: Record<GradientPreset, GradientDef> = {
-  aurora: {
-    r: '70+50*sin(2*PI*X/W+1.2)+30*cos(3*PI*Y/H)',
-    g: '90+80*sin(2*PI*Y/H+0.5)+40*cos(1.5*PI*X/W)',
-    b: '180+60*sin(1.5*PI*X/W)+40*cos(2*PI*Y/H+2)',
-  },
-  sunset: {
-    r: '210+40*sin(2*PI*Y/H)+20*cos(3*PI*X/W)',
-    g: '90+60*sin(2.5*PI*X/W+1)+30*cos(2*PI*Y/H)',
-    b: '130+80*cos(2*PI*X/W+PI*Y/H)+30*sin(3*PI*Y/H)',
-  },
-  ocean: {
-    r: '20+35*sin(2*PI*X/W*1.5)+15*cos(2*PI*Y/H)',
-    g: '100+70*sin(2*PI*Y/H+0.7)+35*cos(1.8*PI*X/W)',
-    b: '190+55*cos(PI*X/W+1.5*PI*Y/H)+30*sin(2.5*PI*X/W)',
-  },
-  lavender: {
-    r: '155+65*sin(2*PI*X/W+0.8)+25*cos(2.5*PI*Y/H)',
-    g: '95+45*sin(2.5*PI*Y/H+1.2)+20*cos(2*PI*X/W)',
-    b: '200+45*cos(1.5*PI*(X+Y)/(W+H))+25*sin(3*PI*X/W)',
-  },
-  mint: {
-    r: '130+55*sin(2*PI*Y/H+0.5)+20*cos(2.5*PI*X/W)',
-    g: '195+50*cos(1.5*PI*X/W+0.3)+25*sin(2*PI*Y/H)',
-    b: '165+55*sin(2*PI*X/W+2*PI*Y/H)+20*cos(3*PI*Y/H)',
-  },
-  ember: {
-    r: '200+50*sin(1.5*PI*X/W)+25*cos(2*PI*Y/H+1)',
-    g: '70+55*sin(2*PI*Y/H+0.8)+25*cos(2.5*PI*X/W)',
-    b: '40+35*cos(2*PI*(X+Y)/(W+H)+1.5)+20*sin(3*PI*X/W)',
-  },
-};
+export function backgroundImagePath(preset: BackgroundPreset): string {
+  return join(__dirname, '..', '..', '..', 'assets', 'backgrounds', `${preset}.png`);
+}
 
 export interface BackgroundOptions {
-  gradient: GradientPreset;
+  gradient: BackgroundPreset;
   /** Padding as a percentage of output size (0–50). Default 8. */
   padding: number;
   /** Corner radius in pixels. Default 12. */
@@ -59,7 +32,7 @@ export interface BackgroundOptions {
 }
 
 export const DEFAULT_BACKGROUND: BackgroundOptions = {
-  gradient: 'aurora',
+  gradient: 'midnight',
   padding: 8,
   cornerRadius: 12,
   shadow: true,
@@ -126,9 +99,6 @@ export function computeFitLayout(
 
 function buildCornerRadiusExpr(radius: number): string {
   const R = radius;
-  // geq alpha expression that rounds the four corners.
-  // Inside the corner quadrant: use circular distance check.
-  // Outside corner quadrants: fully opaque.
   return (
     `a='if(gt(abs(X-W/2),W/2-${R})*gt(abs(Y-H/2),H/2-${R}),` +
     `if(lte(hypot(abs(X-W/2)-(W/2-${R}),abs(Y-H/2)-(H/2-${R})),${R}),255,0),255)'` +
@@ -137,13 +107,12 @@ function buildCornerRadiusExpr(radius: number): string {
 }
 
 /**
- * Build an FFmpeg filter_complex that composites the video onto a colourful
- * gradient background with optional rounded corners and drop shadow.
+ * Build an FFmpeg filter_complex that composites the video onto an image
+ * background with optional rounded corners and drop shadow.
  *
- * @param effectFilters  Any pre-existing -vf style effect filters (may be empty).
- * @param viewport       Output dimensions.
- * @param opts           Background configuration.
- * @param layout         Optional pre-computed layout (for fit/letterbox cases).
+ * Input [0:v] = the recording video
+ * Input [1:v] = the background image
+ *
  * @returns The full filter_complex string. Output label is `[out]`.
  */
 export function buildBackgroundFilterComplex(
@@ -152,7 +121,6 @@ export function buildBackgroundFilterComplex(
   opts: BackgroundOptions,
   layout?: LayoutMetrics,
 ): string {
-  const grad = gradients[opts.gradient];
   const m = layout ?? computeLayout(viewport, opts.padding);
   const { outW, outH, scaledW, scaledH, padX, padY } = m;
 
@@ -178,10 +146,9 @@ export function buildBackgroundFilterComplex(
     chains.push(fgChain);
   }
 
-  // ── Chain 2: generate gradient background ──
+  // ── Chain 2: scale background image to output size, loop to match video duration ──
   chains.push(
-    `color=s=${outW}x${outH}:c=black:r=30,` +
-    `geq=r='${grad.r}':g='${grad.g}':b='${grad.b}',format=rgba[bg]`,
+    `[1:v]scale=${outW}:${outH},format=rgba,loop=-1:size=1:start=0[bg]`,
   );
 
   // ── Chain 3: composite ──
