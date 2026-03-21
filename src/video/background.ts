@@ -1,9 +1,22 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
+import { existsSync } from 'node:fs';
 import type { Viewport } from '../recording/types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** Walk up from __dirname until we find package.json (the package root). */
+function findPackageRoot(): string {
+  let dir = __dirname;
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, 'package.json'))) return dir;
+    dir = dirname(dir);
+  }
+  return __dirname;
+}
+
+const PKG_ROOT = findPackageRoot();
 
 export type BackgroundPreset = 'midnight' | 'ember' | 'forest' | 'nebula' | 'slate' | 'copper';
 
@@ -14,11 +27,9 @@ export function randomPreset(): BackgroundPreset {
   return BACKGROUND_PRESETS[Math.floor(Math.random() * BACKGROUND_PRESETS.length)]!;
 }
 
-/** Resolve the absolute path to a background image.
- *  At runtime __dirname is dist/video/, so we go up 3 levels to the project root.
- */
+/** Resolve the absolute path to a background image. */
 export function backgroundImagePath(preset: BackgroundPreset): string {
-  return join(__dirname, '..', '..', '..', 'assets', 'backgrounds', `${preset}.png`);
+  return join(PKG_ROOT, 'assets', 'backgrounds', `${preset}.png`);
 }
 
 export interface BackgroundOptions {

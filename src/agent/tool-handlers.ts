@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
 import * as actions from '../browser/actions.js';
-import { getAccessibilityTree, getPageInfo } from '../browser/accessibility.js';
+import { getInteractiveElements, getPageInfo } from '../browser/accessibility.js';
 import { EventLog } from '../recording/event-log.js';
 import { screenshotsDir } from '../utils/paths.js';
 import { writeFileSync } from 'node:fs';
@@ -24,12 +24,31 @@ export class ToolHandlers {
     private actionDelayMs: number
   ) {}
 
+  /** Capture screenshot + interactive element list in one shot. */
+  private async screenshotWithElements(): Promise<ToolResult['content']> {
+    const [screenshot, { formatted }] = await Promise.all([
+      this.page.screenshot({ type: 'jpeg', quality: 50 }),
+      getInteractiveElements(this.page),
+    ]);
+    this.saveScreenshot(screenshot);
+    return [
+      {
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: screenshot.toString('base64') },
+      },
+      { type: 'text', text: formatted },
+    ];
+  }
+
   async handle(toolName: string, input: Record<string, any>): Promise<ToolResult> {
     switch (toolName) {
       case 'screenshot':
         return this.handleScreenshot();
+      case 'get_interactive_elements':
+        return this.handleGetInteractiveElements();
       case 'get_accessibility_tree':
-        return this.handleAccessibilityTree();
+        // Legacy: redirect to interactive elements
+        return this.handleGetInteractiveElements();
       case 'get_page_info':
         return this.handlePageInfo();
       case 'click':
@@ -38,6 +57,8 @@ export class ToolHandlers {
         return this.handleType(input);
       case 'press_key':
         return this.handlePressKey(input);
+      case 'go_back':
+        return this.handleGoBack(input);
       case 'scroll':
         return this.handleScroll(input);
       case 'hover':
@@ -63,21 +84,21 @@ export class ToolHandlers {
 
   private saveScreenshot(buffer: Buffer): string {
     this.actionCount++;
-    const filename = `step-${String(this.actionCount).padStart(3, '0')}.png`;
+    const filename = `step-${String(this.actionCount).padStart(3, '0')}.jpg`;
     const dir = screenshotsDir(this.recordingDir);
     const path = join(dir, filename);
     writeFileSync(path, buffer);
     return path;
   }
 
-  private screenshotContent(buffer: Buffer, mediaType: 'image/png' | 'image/jpeg' = 'image/png'): ToolResult['content'] {
+  private screenshotContent(buffer: Buffer): ToolResult['content'] {
     this.saveScreenshot(buffer);
     return [
       {
         type: 'image',
         source: {
           type: 'base64',
-          media_type: mediaType,
+          media_type: 'image/jpeg',
           data: buffer.toString('base64'),
         },
       },
@@ -86,22 +107,24 @@ export class ToolHandlers {
 
   private extractTarget(input: Record<string, any>): ElementTarget {
     return {
+      index: input.index,
       role: input.role,
       name: input.name,
-      text: input.target_text ?? (input.role || input.selector ? input.text : undefined),
+      text: input.target_text ?? (input.role || input.selector || input.index !== undefined ? input.text : undefined),
       selector: input.selector,
+      x: input.x,
+      y: input.y,
     };
   }
 
   private async handleScreenshot(): Promise<ToolResult> {
-    const screenshot = await this.page.screenshot({ type: 'png' });
-    return { content: this.screenshotContent(screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
-  private async handleAccessibilityTree(): Promise<ToolResult> {
-    const { tree, elementCount } = await getAccessibilityTree(this.page);
+  private async handleGetInteractiveElements(): Promise<ToolResult> {
+    const { formatted } = await getInteractiveElements(this.page);
     return {
-      content: [{ type: 'text', text: `Accessibility tree (${elementCount} elements):\n${tree}` }],
+      content: [{ type: 'text', text: formatted }],
     };
   }
 
@@ -122,18 +145,17 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleType(input: Record<string, any>): Promise<ToolResult> {
     const target = this.extractTarget(input);
-    // For type tool, if text is the value to type, use target_text for element matching
-    if (!target.role && !target.selector && !target.text) {
-      // No explicit target — focus is likely already on the element
-      // Type directly into focused element
+    const hasTarget = target.index !== undefined || target.role || target.selector || target.text;
+
+    if (!hasTarget) {
+      // No explicit target — type into focused element
       await this.page.keyboard.type(input.text, { delay: input.character_by_character ? 50 : undefined });
       await this.page.waitForTimeout(this.actionDelayMs);
-      const screenshot = await this.page.screenshot({ type: 'png' });
       this.eventLog.append({
         type: 'type',
         description: input.description,
@@ -141,8 +163,9 @@ export class ToolHandlers {
         value: input.text,
         url: this.page.url(),
       });
-      return { content: this.screenshotContent(screenshot) };
+      return { content: await this.screenshotWithElements() };
     }
+
     const result = await actions.type(
       this.page,
       target,
@@ -158,7 +181,7 @@ export class ToolHandlers {
       value: input.text,
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handlePressKey(input: Record<string, any>): Promise<ToolResult> {
@@ -170,13 +193,24 @@ export class ToolHandlers {
       value: input.key,
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
+  }
+
+  private async handleGoBack(input: Record<string, any>): Promise<ToolResult> {
+    const result = await actions.goBack(this.page, this.actionDelayMs);
+    this.eventLog.append({
+      type: 'navigate',
+      description: input.description,
+      viewport: this.viewport(),
+      url: result.url,
+    });
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleScroll(input: Record<string, any>): Promise<ToolResult> {
     const toElement: ElementTarget | undefined =
-      input.to_role || input.to_name || input.to_text || input.to_selector
-        ? { role: input.to_role, name: input.to_name, text: input.to_text, selector: input.to_selector }
+      input.to_index !== undefined || input.to_text || input.to_selector
+        ? { index: input.to_index, text: input.to_text, selector: input.to_selector }
         : undefined;
     const result = await actions.scroll(
       this.page,
@@ -190,7 +224,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleHover(input: Record<string, any>): Promise<ToolResult> {
@@ -203,7 +237,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleNavigate(input: Record<string, any>): Promise<ToolResult> {
@@ -215,7 +249,7 @@ export class ToolHandlers {
       value: input.url,
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleWait(input: Record<string, any>): Promise<ToolResult> {
@@ -231,7 +265,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleSelectOption(input: Record<string, any>): Promise<ToolResult> {
@@ -250,7 +284,7 @@ export class ToolHandlers {
       value: input.option_label ?? input.option_value,
       url: result.url,
     });
-    return { content: this.screenshotContent(result.screenshot) };
+    return { content: await this.screenshotWithElements() };
   }
 
   private async handleDone(input: Record<string, any>): Promise<ToolResult> {

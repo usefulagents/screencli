@@ -2,7 +2,7 @@ import { join, dirname } from 'node:path';
 import type { RecordingEvent, Viewport } from '../recording/types.js';
 import { generateZoomKeyframes, buildZoomFilterExpr } from './zoom.js';
 import { buildHighlightFilters } from './highlight.js';
-import { buildCursorFilter } from './cursor.js';
+import { buildCursorOverlay } from './cursor.js';
 import { computeActiveSegments, buildTrimFilter, estimateTrimmedDuration } from './trim.js';
 import { runFFmpeg, getVideoDuration } from './ffmpeg.js';
 import { buildBackgroundFilterComplex, backgroundImagePath, type BackgroundOptions } from './background.js';
@@ -55,20 +55,124 @@ function remapEvents(events: RecordingEvent[], segments: { start_s: number; end_
 
     for (const seg of segments) {
       if (t_s < seg.start_s) {
-        // Event is before this segment — it's in a trimmed gap, snap to current newT
         break;
       } else if (t_s <= seg.end_s) {
-        // Event is within this segment
         newT += t_s - seg.start_s;
         break;
       } else {
-        // Event is after this segment — accumulate the segment duration
         newT += seg.end_s - seg.start_s;
       }
     }
 
     return { ...e, timestamp_ms: Math.round(newT * 1000) };
   });
+}
+
+/**
+ * Build a filter_complex that applies all effects (highlights, animated cursor,
+ * zoom) and optionally composites onto a background.
+ *
+ * Filter order (in original viewport coordinates):
+ *   1. Highlight drawboxes  (marks click/type targets)
+ *   2. Cursor overlay        (smooth animated dot)
+ *   3. Zoom (zoompan)        (crops + scales — cursor/highlights move with content)
+ *   4. Background composite  (gradient, padding, corners, shadow)
+ */
+function buildFullFilterComplex(
+  eventsForEffects: RecordingEvent[],
+  viewport: Viewport,
+  options: ComposeOptions,
+): { filterComplex: string; outputLabel: string; extraInputs: string[] } {
+  const chains: string[] = [];
+  const extraInputs: string[] = [];
+  let videoLabel = '0:v';
+  let nextInputIdx = 1; // [0] is the main video
+
+  // ── 1. Animated cursor overlay (pointer image) ──
+  const cursorOverlay = options.cursor
+    ? buildCursorOverlay(eventsForEffects, viewport)
+    : null;
+
+  if (cursorOverlay) {
+    const cursorIdx = nextInputIdx++;
+    extraInputs.push(cursorOverlay.imagePath);
+    chains.push(`[${cursorIdx}:v]${cursorOverlay.inputFilter}[cursor]`);
+    chains.push(`[${videoLabel}][cursor]overlay=${cursorOverlay.overlay}[with_cursor]`);
+    videoLabel = 'with_cursor';
+  }
+
+  // ── 3. Zoom ──
+  let zoomFilter = '';
+  if (options.zoom) {
+    const keyframes = generateZoomKeyframes(eventsForEffects, viewport);
+    zoomFilter = buildZoomFilterExpr(keyframes, viewport);
+  }
+
+  if (zoomFilter) {
+    chains.push(`[${videoLabel}]${zoomFilter}[zoomed]`);
+    videoLabel = 'zoomed';
+  }
+
+  // ── 4. Background composite ──
+  if (options.background) {
+    const bgOpts = options.background;
+    const { outW, outH, scaledW, scaledH, padX, padY } = computeBgLayout(viewport, bgOpts.padding);
+
+    let fgChain = `[${videoLabel}]scale=${scaledW}:${scaledH},format=rgba`;
+    if (bgOpts.cornerRadius > 0) {
+      const R = bgOpts.cornerRadius;
+      fgChain += `,geq=a='if(gt(abs(X-W/2),W/2-${R})*gt(abs(Y-H/2),H/2-${R}),if(lte(hypot(abs(X-W/2)-(W/2-${R}),abs(Y-H/2)-(H/2-${R})),${R}),255,0),255)':r='r(X,Y)':g='g(X,Y)':b='b(X,Y)'`;
+    }
+
+    if (bgOpts.shadow) {
+      fgChain += '[fg_raw]';
+      chains.push(fgChain);
+      chains.push('[fg_raw]split[fg][shadow_src]');
+      chains.push('[shadow_src]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.4,boxblur=12:4[shadow]');
+    } else {
+      fgChain += '[fg]';
+      chains.push(fgChain);
+    }
+
+    const bgIdx = nextInputIdx++;
+    extraInputs.push(backgroundImagePath(options.background.gradient));
+    chains.push(
+      `[${bgIdx}:v]scale=${outW}:${outH},format=rgba,loop=-1:size=1:start=0[bg]`
+    );
+
+    if (bgOpts.shadow) {
+      const sx = padX + 4;
+      const sy = padY + 6;
+      chains.push(`[bg][shadow]overlay=${sx}:${sy}:shortest=1[bg_s]`);
+      chains.push(`[bg_s][fg]overlay=${padX}:${padY}:shortest=1[out]`);
+    } else {
+      chains.push(`[bg][fg]overlay=${padX}:${padY}:shortest=1[out]`);
+    }
+
+    return { filterComplex: chains.join(';'), outputLabel: 'out', extraInputs };
+  }
+
+  return { filterComplex: chains.join(';'), outputLabel: videoLabel, extraInputs };
+}
+
+function even(n: number): number {
+  return n % 2 === 0 ? n : n - 1;
+}
+
+function computeBgLayout(viewport: Viewport, padding: number) {
+  const outW = even(viewport.width);
+  const outH = even(viewport.height);
+  const fraction = padding / 100;
+  const padX = Math.round(outW * fraction);
+  const padY = Math.round(outH * fraction);
+  return {
+    outW,
+    outH,
+    scaledW: even(outW - 2 * padX),
+    scaledH: even(outH - 2 * padY),
+    padX,
+    padY,
+  };
 }
 
 export async function composeVideo(options: ComposeOptions): Promise<string> {
@@ -91,7 +195,6 @@ export async function composeVideo(options: ComposeOptions): Promise<string> {
   let eventsForEffects = options.events;
 
   if (savedTime > 2) {
-    // Worth trimming — do a first pass
     trimmedPath = join(dirname(options.outputPath), '_trimmed.mp4');
     const trimFilter = buildTrimFilter(segments);
     logger.info(`Trimming idle time: ${videoDuration.toFixed(1)}s → ${trimmedDuration.toFixed(1)}s (saving ${savedTime.toFixed(1)}s)`);
@@ -114,56 +217,28 @@ export async function composeVideo(options: ComposeOptions): Promise<string> {
     logger.info('No significant idle time to trim.');
   }
 
-  // Step 2: Build effect filters using remapped timestamps
-  const filters: string[] = [];
+  // Step 2: Build and apply effects via filter_complex
+  const hasEffects = options.highlight || options.cursor || options.zoom || options.background;
 
-  if (options.zoom) {
-    const keyframes = generateZoomKeyframes(eventsForEffects, options.viewport);
-    const zoomFilter = buildZoomFilterExpr(keyframes, options.viewport);
-    if (zoomFilter) {
-      filters.push(zoomFilter);
-    }
-  }
+  if (hasEffects) {
+    const { filterComplex, outputLabel, extraInputs } = buildFullFilterComplex(
+      eventsForEffects, options.viewport, options,
+    );
 
-  if (options.highlight) {
-    const highlightFilters = buildHighlightFilters(eventsForEffects, options.viewport);
-    filters.push(...highlightFilters);
-  }
-
-  if (options.cursor) {
-    const cursorFilters = buildCursorFilter(eventsForEffects, options.viewport);
-    filters.push(...cursorFilters);
-  }
-
-  // Step 3: Apply effects + optional background
-  if (options.background) {
-    // Use filter_complex to composite video onto background image
-    const bgImage = backgroundImagePath(options.background.gradient);
-    const fc = buildBackgroundFilterComplex(filters, options.viewport, options.background);
-    logger.info(`Applying background (${options.background.gradient}) with ${filters.length} effect filters...`);
+    const effectCount = [options.highlight, options.cursor, options.zoom].filter(Boolean).length;
+    logger.info(
+      options.background
+        ? `Applying background (${options.background.gradient}) with ${effectCount} effect filters...`
+        : `Applying ${effectCount} effect filters...`
+    );
 
     await runFFmpeg({
       input: currentInput,
-      extraInputs: [bgImage],
+      extraInputs: extraInputs.length > 0 ? extraInputs : undefined,
       output: options.outputPath,
-      filterComplex: fc,
+      filterComplex,
       outputArgs: [
-        '-map', '[out]',
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-pix_fmt', 'yuv420p',
-      ],
-    });
-  } else if (filters.length > 0) {
-    const filterChain = filters.join(',');
-    logger.info(`Applying ${filters.length} effect filters...`);
-
-    await runFFmpeg({
-      input: currentInput,
-      output: options.outputPath,
-      outputArgs: [
-        '-vf', filterChain,
+        '-map', `[${outputLabel}]`,
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
@@ -171,6 +246,7 @@ export async function composeVideo(options: ComposeOptions): Promise<string> {
       ],
     });
   } else {
+    // No effects — just re-encode
     if (currentInput !== options.outputPath) {
       if (trimmedPath) {
         const { renameSync } = await import('node:fs');

@@ -8,8 +8,9 @@ export interface ActionResult {
   url: string;
 }
 
+/** Capture a JPEG screenshot (much smaller than PNG → faster API calls). */
 async function captureState(page: Page): Promise<{ screenshot: Buffer; url: string }> {
-  const screenshot = await page.screenshot({ type: 'png' });
+  const screenshot = await page.screenshot({ type: 'jpeg', quality: 75 });
   return { screenshot, url: page.url() };
 }
 
@@ -19,6 +20,19 @@ export async function click(
   clickType: 'left' | 'right' | 'double' = 'left',
   delayMs: number = 0
 ): Promise<ActionResult> {
+  // Coordinate-based click (fallback)
+  if (target.x !== undefined && target.y !== undefined) {
+    if (clickType === 'double') {
+      await page.mouse.dblclick(target.x, target.y);
+    } else {
+      await page.mouse.click(target.x, target.y, { button: clickType });
+    }
+    const bounding_box = { x: target.x - 5, y: target.y - 5, width: 10, height: 10 };
+    if (delayMs > 0) await page.waitForTimeout(delayMs);
+    const state = await captureState(page);
+    return { bounding_box, ...state };
+  }
+
   const locator = resolveLocator(page, target);
   const bounding_box = await getBoundingBox(locator);
 
@@ -69,6 +83,18 @@ export async function pressKey(
   return { ...state };
 }
 
+export async function goBack(
+  page: Page,
+  delayMs: number = 0
+): Promise<ActionResult> {
+  await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {
+    // goBack may fail if there's no history — that's OK
+  });
+  if (delayMs > 0) await page.waitForTimeout(delayMs);
+  const state = await captureState(page);
+  return { ...state };
+}
+
 export async function scroll(
   page: Page,
   options: {
@@ -91,12 +117,10 @@ export async function scroll(
     const deltaY =
       options.direction === 'up' ? -amount : options.direction === 'down' ? amount : 0;
 
-    // Smooth scroll: break into small increments over ~400ms
+    // Smooth scroll for recording quality
     const STEP_PX = 40;
-    const STEP_DELAY_MS = 16; // ~60fps
-    const totalX = Math.abs(deltaX);
-    const totalY = Math.abs(deltaY);
-    const total = Math.max(totalX, totalY);
+    const STEP_DELAY_MS = 16;
+    const total = Math.max(Math.abs(deltaX), Math.abs(deltaY));
     const steps = Math.max(1, Math.ceil(total / STEP_PX));
     const stepX = deltaX / steps;
     const stepY = deltaY / steps;

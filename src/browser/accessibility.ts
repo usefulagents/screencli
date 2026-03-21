@@ -14,17 +14,114 @@ export interface AccessibilityNode {
   selected?: boolean;
 }
 
+export interface InteractiveElement {
+  index: number;
+  tag: string;
+  role: string;
+  name: string;
+  text: string;
+  type?: string;
+  value?: string;
+  bbox: { x: number; y: number; width: number; height: number };
+}
+
+/**
+ * Find all interactive elements visible in the viewport, inject `data-screencli-idx`
+ * attributes for reliable targeting, and return a formatted list.
+ *
+ * This is the primary observation tool — the agent picks elements by index.
+ */
+export async function getInteractiveElements(page: Page): Promise<{
+  elements: InteractiveElement[];
+  formatted: string;
+}> {
+  const elements: InteractiveElement[] = await page.evaluate(`
+    (function() {
+      document.querySelectorAll('[data-screencli-idx]').forEach(function(el) {
+        el.removeAttribute('data-screencli-idx');
+      });
+
+      var selectors = 'a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=textbox], [role=checkbox], [role=radio], [role=tab], [role=menuitem], [role=switch], [role=combobox], [role=option], [role=searchbox], [tabindex]:not([tabindex="-1"])';
+      var allEls = document.querySelectorAll(selectors);
+      var results = [];
+      var seen = new Set();
+      var idx = 0;
+
+      for (var i = 0; i < allEls.length; i++) {
+        var el = allEls[i];
+        if (seen.has(el)) continue;
+        seen.add(el);
+
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+        var rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        if (rect.right < 0 || rect.left > window.innerWidth) continue;
+
+        el.setAttribute('data-screencli-idx', String(idx));
+
+        var tag = el.tagName.toLowerCase();
+        var rawRole = el.getAttribute('role');
+        var role = rawRole || (tag === 'a' ? 'link' : tag === 'button' ? 'button' :
+          tag === 'input' ? 'input' : tag === 'select' ? 'select' :
+          tag === 'textarea' ? 'textarea' : tag);
+        var name = el.getAttribute('aria-label') || el.getAttribute('title')
+          || el.getAttribute('placeholder') || '';
+        var text = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+        var type = el.type || undefined;
+        var value = el.value || undefined;
+
+        results.push({
+          index: idx,
+          tag: tag, role: role, name: name, text: text, type: type, value: value,
+          bbox: {
+            x: Math.round(rect.x), y: Math.round(rect.y),
+            width: Math.round(rect.width), height: Math.round(rect.height),
+          },
+        });
+
+        idx++;
+      }
+
+      return results;
+    })()
+  `) as InteractiveElement[];
+
+  // Cap at 50 elements to keep token count low
+  const capped = elements.slice(0, 50);
+
+  const lines = capped.map(el => {
+    let desc = `[${el.index}] ${el.role}`;
+    if (el.name) desc += ` "${el.name}"`;
+    else if (el.text && el.text.length > 0) desc += ` "${el.text}"`;
+    if (el.type && el.type !== el.tag && el.type !== 'submit') desc += ` (${el.type})`;
+    if (el.value) desc += ` value="${el.value}"`;
+    return desc;
+  });
+
+  const url = page.url();
+  const title = await page.title();
+  const more = elements.length > 50 ? `\n(${elements.length - 50} more elements below viewport — scroll to see them)` : '';
+  const header = `URL: ${url}\nTitle: ${title}\n${capped.length} elements:\n`;
+
+  return { elements, formatted: header + lines.join('\n') + more };
+}
+
+/**
+ * Legacy: get the full ARIA accessibility tree.
+ * Prefer getInteractiveElements() for agent use — it's smaller and indexed.
+ */
 export async function getAccessibilityTree(page: Page): Promise<{
   tree: string;
   elementCount: number;
 }> {
-  // Use Playwright's ariaSnapshot for modern versions, fall back to locator-based approach
   try {
     const snapshot = await page.locator('body').ariaSnapshot();
     const lineCount = snapshot.split('\n').length;
     return { tree: snapshot, elementCount: lineCount };
   } catch {
-    // Fallback: use page.evaluate with string function to avoid DOM type issues
     const tree = await page.evaluate(`
       (function() {
         function walk(el, depth) {

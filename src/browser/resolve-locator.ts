@@ -5,9 +5,25 @@ export interface ElementTarget {
   name?: string;
   text?: string;
   selector?: string;
+  index?: number;
+  x?: number;
+  y?: number;
 }
 
+/**
+ * Resolve a Playwright Locator from an ElementTarget.
+ *
+ * Priority:
+ *   1. index — uses data-screencli-idx attribute (most reliable, from get_interactive_elements)
+ *   2. role + name — Playwright getByRole
+ *   3. text — Playwright getByText
+ *   4. selector — CSS selector
+ *   5. x + y — coordinate click (handled separately in actions.ts)
+ */
 export function resolveLocator(page: Page, target: ElementTarget): Locator {
+  if (target.index !== undefined) {
+    return page.locator(`[data-screencli-idx="${target.index}"]`);
+  }
   if (target.role && target.name) {
     return page.getByRole(target.role as any, { name: target.name });
   }
@@ -20,7 +36,7 @@ export function resolveLocator(page: Page, target: ElementTarget): Locator {
   if (target.selector) {
     return page.locator(target.selector);
   }
-  throw new Error('No valid target provided. Use role+name, text, or selector.');
+  throw new Error('No valid target provided. Use index (from get_interactive_elements), role+name, text, or selector.');
 }
 
 export async function getBoundingBox(

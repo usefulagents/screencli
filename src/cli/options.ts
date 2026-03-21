@@ -6,7 +6,7 @@ export const outputOption = new Option('-o, --output <dir>', 'Output directory')
 
 export const viewportOption = new Option('--viewport <WxH>', 'Viewport size').default('1920x1080');
 
-export const modelOption = new Option('-m, --model <model>', 'Claude model to use').default('claude-sonnet-4-20250514');
+export const modelOption = new Option('-m, --model <model>', 'Claude model to use').default('claude-haiku-4-5-20251001');
 
 export const headlessOption = new Option('--no-headless', 'Show browser window');
 

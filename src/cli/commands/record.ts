@@ -245,7 +245,7 @@ export const recordCommand = new Command('record')
           outputPath: resolve(recDir, 'composed.mp4'),
           viewport,
           zoom: true,
-          highlight: true,
+          highlight: false,
           cursor: true,
           background,
         });

@@ -100,22 +100,24 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     url: options.url,
   });
 
-  // Take initial screenshot
-  const initialScreenshot = await options.page.screenshot({ type: 'png' });
+  // Take initial screenshot + element list (agent can act immediately)
+  const initialScreenshot = await options.page.screenshot({ type: 'jpeg', quality: 75 });
+  const { getInteractiveElements } = await import('../browser/accessibility.js');
+  const { formatted: initialElements } = await getInteractiveElements(options.page);
   messages.push({
     role: 'user',
     content: [
       {
-        type: 'text',
-        text: 'Page loaded. Screenshot attached. Start executing the task immediately — do not call screenshot or get_accessibility_tree unless you need to find a specific element.',
-      },
-      {
         type: 'image',
         source: {
           type: 'base64',
-          media_type: 'image/png',
+          media_type: 'image/jpeg',
           data: initialScreenshot.toString('base64'),
         },
+      },
+      {
+        type: 'text',
+        text: `Page loaded. Use the element indices below to interact.\n\n${initialElements}`,
       },
     ],
   });
@@ -141,7 +143,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
         } else {
           response = await client!.messages.create({
             model: options.model,
-            max_tokens: 4096,
+            max_tokens: 1024,
             system: systemPrompt,
             tools,
             messages,
