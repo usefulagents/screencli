@@ -24,20 +24,10 @@ export class ToolHandlers {
     private actionDelayMs: number
   ) {}
 
-  /** Capture screenshot + interactive element list in one shot. */
-  private async screenshotWithElements(): Promise<ToolResult['content']> {
-    const [screenshot, { formatted }] = await Promise.all([
-      this.page.screenshot({ type: 'jpeg', quality: 50 }),
-      getInteractiveElements(this.page),
-    ]);
-    this.saveScreenshot(screenshot);
-    return [
-      {
-        type: 'image',
-        source: { type: 'base64', media_type: 'image/jpeg', data: screenshot.toString('base64') },
-      },
-      { type: 'text', text: formatted },
-    ];
+  /** Return element list only (no vision — fast). Used by all action tools. */
+  private async elementsOnly(): Promise<ToolResult['content']> {
+    const { formatted } = await getInteractiveElements(this.page);
+    return [{ type: 'text', text: formatted }];
   }
 
   async handle(toolName: string, input: Record<string, any>): Promise<ToolResult> {
@@ -118,7 +108,18 @@ export class ToolHandlers {
   }
 
   private async handleScreenshot(): Promise<ToolResult> {
-    return { content: await this.screenshotWithElements() };
+    // Screenshot is the opt-in vision tool — returns actual image + elements
+    const [screenshot, { formatted }] = await Promise.all([
+      this.page.screenshot({ type: 'jpeg', quality: 50 }),
+      getInteractiveElements(this.page),
+    ]);
+    this.saveScreenshot(screenshot);
+    return {
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: screenshot.toString('base64') } },
+        { type: 'text', text: formatted },
+      ],
+    };
   }
 
   private async handleGetInteractiveElements(): Promise<ToolResult> {
@@ -145,7 +146,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleType(input: Record<string, any>): Promise<ToolResult> {
@@ -163,7 +164,7 @@ export class ToolHandlers {
         value: input.text,
         url: this.page.url(),
       });
-      return { content: await this.screenshotWithElements() };
+      return { content: await this.elementsOnly() };
     }
 
     const result = await actions.type(
@@ -181,7 +182,7 @@ export class ToolHandlers {
       value: input.text,
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handlePressKey(input: Record<string, any>): Promise<ToolResult> {
@@ -193,7 +194,7 @@ export class ToolHandlers {
       value: input.key,
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleGoBack(input: Record<string, any>): Promise<ToolResult> {
@@ -204,7 +205,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleScroll(input: Record<string, any>): Promise<ToolResult> {
@@ -224,7 +225,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleHover(input: Record<string, any>): Promise<ToolResult> {
@@ -237,7 +238,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleNavigate(input: Record<string, any>): Promise<ToolResult> {
@@ -249,7 +250,7 @@ export class ToolHandlers {
       value: input.url,
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleWait(input: Record<string, any>): Promise<ToolResult> {
@@ -265,7 +266,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleSelectOption(input: Record<string, any>): Promise<ToolResult> {
@@ -284,7 +285,7 @@ export class ToolHandlers {
       value: input.option_label ?? input.option_value,
       url: result.url,
     });
-    return { content: await this.screenshotWithElements() };
+    return { content: await this.elementsOnly() };
   }
 
   private async handleDone(input: Record<string, any>): Promise<ToolResult> {

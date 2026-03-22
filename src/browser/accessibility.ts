@@ -103,8 +103,25 @@ export async function getInteractiveElements(page: Page): Promise<{
 
   const url = page.url();
   const title = await page.title();
-  const more = elements.length > 50 ? `\n(${elements.length - 50} more elements below viewport — scroll to see them)` : '';
-  const header = `URL: ${url}\nTitle: ${title}\n${capped.length} elements:\n`;
+
+  // Scroll metrics — lets the agent know where it is on the page
+  const scrollInfo = await page.evaluate(`
+    (function() {
+      var y = window.scrollY || document.documentElement.scrollTop;
+      var h = document.documentElement.scrollHeight;
+      var vh = window.innerHeight;
+      return { scrollY: Math.round(y), scrollHeight: Math.round(h), viewportHeight: vh };
+    })()
+  `) as { scrollY: number; scrollHeight: number; viewportHeight: number };
+
+  const scrollPct = scrollInfo.scrollHeight > 0
+    ? Math.round((scrollInfo.scrollY + scrollInfo.viewportHeight) / scrollInfo.scrollHeight * 100)
+    : 100;
+  const atBottom = scrollPct >= 95;
+  const scrollLine = `Scroll: ${scrollInfo.scrollY}px / ${scrollInfo.scrollHeight}px (${scrollPct}%)${atBottom ? ' [AT BOTTOM]' : ''}`;
+
+  const more = elements.length > 50 ? `\n(${elements.length - 50} more elements not shown — scroll to reveal)` : '';
+  const header = `URL: ${url}\nTitle: ${title}\n${scrollLine}\n${capped.length} elements:\n`;
 
   return { elements, formatted: header + lines.join('\n') + more };
 }

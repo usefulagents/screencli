@@ -11,7 +11,7 @@ export const tools: ToolDef[] = [
   },
   {
     name: 'screenshot',
-    description: 'Capture a screenshot. Only needed if you want to look without acting.',
+    description: 'Capture a visual screenshot of the page. Only use when you need to see images, charts, or complex visual layout. Most tasks do NOT need this — the element list is sufficient.',
     input_schema: { type: 'object', properties: {}, required: [] },
   },
 

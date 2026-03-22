@@ -100,24 +100,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     url: options.url,
   });
 
-  // Take initial screenshot + element list (agent can act immediately)
-  const initialScreenshot = await options.page.screenshot({ type: 'jpeg', quality: 75 });
+  // Send element list only (no vision) — agent can act immediately
   const { getInteractiveElements } = await import('../browser/accessibility.js');
   const { formatted: initialElements } = await getInteractiveElements(options.page);
   messages.push({
     role: 'user',
     content: [
       {
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: 'image/jpeg',
-          data: initialScreenshot.toString('base64'),
-        },
-      },
-      {
         type: 'text',
-        text: `Page loaded. Use the element indices below to interact.\n\n${initialElements}`,
+        text: `Page loaded. Use the element indices to interact.\n\n${initialElements}`,
       },
     ],
   });

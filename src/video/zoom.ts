@@ -91,6 +91,8 @@ function computeCropForEvent(event: RecordingEvent, viewport: Viewport): CropReg
 interface ZoomTarget {
   time_s: number;
   crop: CropRegion;
+  /** True if this action caused a page navigation (URL changed). */
+  navigated: boolean;
 }
 
 type ZoomSession = ZoomTarget[];
@@ -102,11 +104,16 @@ type ZoomSession = ZoomTarget[];
  */
 function groupIntoSessions(events: RecordingEvent[], viewport: Viewport): ZoomSession[] {
   const targets: ZoomTarget[] = [];
+  let prevUrl = '';
   for (const event of events) {
     const crop = computeCropForEvent(event, viewport);
-    if (crop) {
-      targets.push({ time_s: event.timestamp_ms / 1000, crop });
+    const navigated = !!event.url && event.url !== prevUrl && prevUrl !== '';
+    // Skip navigation clicks — the page content changes unpredictably in the video,
+    // making zoom timing impossible to get right. The cursor pointer still shows the target.
+    if (crop && !navigated) {
+      targets.push({ time_s: event.timestamp_ms / 1000, crop, navigated: false });
     }
+    if (event.url) prevUrl = event.url;
   }
 
   if (targets.length === 0) return [];
@@ -185,31 +192,24 @@ export function generateZoomKeyframes(
     keyframes.push({ time_s: Math.max(0, settleTime), ...first.crop });
 
     // ── Pan between targets within the session ──
-    // The camera should arrive at each target BEFORE the action happens.
     for (let i = 1; i < session.length; i++) {
       const prev = session[i - 1]!;
       const curr = session[i]!;
       const gap = curr.time_s - prev.time_s;
 
-      // Hold at the previous target briefly after its action, then pan to
-      // arrive at the next target SETTLE_BEFORE_S before its action.
       const arriveBy = curr.time_s - SETTLE_BEFORE_S;
-
-      // Hold at prev for 40% of the gap or until we need to start panning
       const holdEnd = Math.min(prev.time_s + gap * 0.4, arriveBy - 0.1);
 
       if (holdEnd > prev.time_s + 0.05) {
         keyframes.push({ time_s: holdEnd, ...prev.crop });
       }
 
-      // Arrive at next target early
       keyframes.push({ time_s: Math.max(holdEnd + 0.05, arriveBy), ...curr.crop });
     }
 
-    // ── Release: hold after last action, then zoom out ──
+    // ── Release: smooth zoom-out ──
     const holdEnd = last.time_s + HOLD_AFTER_S;
     keyframes.push({ time_s: holdEnd, ...last.crop });
-
     const resetEnd = holdEnd + RELEASE_S;
     keyframes.push({ time_s: resetEnd, ...full });
   }
