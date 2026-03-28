@@ -122,15 +122,37 @@ export const recordCommand = new Command('record')
     const viewport = parseViewport(opts.viewport);
     const id = uuidv4();
     const recDir = recordingDir(resolve(opts.output), id);
+    const startTime = Date.now();
 
-    output.header('screencli record');
-    output.info(`Recording ID: ${id}`);
-    output.info(`URL: ${url}`);
-    output.info(`Prompt: ${opts.prompt}`);
-    output.info(`Viewport: ${viewport.width}x${viewport.height}`);
-    output.info(`Model: ${opts.model}`);
-    output.info(`Output: ${recDir}`);
-    console.log('');
+    // ── TUI or fallback ──
+    const isTTY = Boolean(process.stdout.isTTY);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let bus: any;
+    let tuiExit: Promise<void> | undefined;
+
+    if (isTTY) {
+      try {
+        // Dynamic import so Ink/React are only loaded in TTY mode
+        const tuiPath = '../../tui/index.js';
+        const tui = await import(/* webpackIgnore: true */ tuiPath);
+        bus = new tui.RecordingEventBus();
+        const instance = tui.runRecordingTUI({ bus, url, prompt: opts.prompt, id, startTime });
+        tuiExit = instance.waitUntilExit();
+      } catch {
+        // Ink not available — fall back to simple output
+      }
+    }
+
+    if (!bus) {
+      output.header('screencli record');
+      output.info(`Recording ID: ${id}`);
+      output.info(`URL: ${url}`);
+      output.info(`Prompt: ${opts.prompt}`);
+      output.info(`Viewport: ${viewport.width}x${viewport.height}`);
+      output.info(`Model: ${opts.model}`);
+      output.info(`Output: ${recDir}`);
+      console.log('');
+    }
 
     // ── Auth: login handoff or saved state ──
     let storageState: object | undefined;
@@ -151,13 +173,17 @@ export const recordCommand = new Command('record')
       const loaded = loadAuthState(opts.auth);
       if (loaded) {
         storageState = loaded;
-        output.success(`Loaded saved auth: "${opts.auth}"`);
+        if (!bus) output.success(`Loaded saved auth: "${opts.auth}"`);
       }
     }
 
     // Launch browser (recording starts here — login is excluded)
-    const spinner = output.createSpinner('Launching browser...');
-    spinner.start();
+    bus?.emitPhase('launching', 'Launching browser...');
+    let spinner: ReturnType<typeof output.createSpinner> | undefined;
+    if (!bus) {
+      spinner = output.createSpinner('Launching browser...');
+      spinner.start();
+    }
     const session = await launchSession({
       viewport,
       headless: opts.headless !== false,
@@ -165,13 +191,16 @@ export const recordCommand = new Command('record')
       recordDir: recDir,
       storageState,
     });
-    spinner.succeed('Browser launched');
+    if (!bus) spinner?.succeed('Browser launched');
 
     // Run agent loop
     const eventLog = new EventLog(eventsPath(recDir));
 
-    console.log('');
-    output.header('Agent Actions');
+    bus?.emitPhase('recording');
+    if (!bus) {
+      console.log('');
+      output.header('Agent Actions');
+    }
 
     let result;
     try {
@@ -187,22 +216,35 @@ export const recordCommand = new Command('record')
         actionDelayMs: config.actionDelayMs,
         maxSteps: parseInt(opts.maxSteps, 10),
         onAction: (step, toolName, description) => {
-          output.actionLog(step, toolName, description);
+          if (bus) {
+            bus.emitAction({ step, toolName, description, timestamp: Date.now() });
+          } else {
+            output.actionLog(step, toolName, description);
+          }
         },
       });
     } catch (err) {
-      output.error(`Agent error: ${err}`);
+      if (bus) {
+        bus.emitError(`Agent error: ${err}`);
+        if (tuiExit) await tuiExit;
+      } else {
+        output.error(`Agent error: ${err}`);
+      }
       eventLog.flush();
       await session.close();
       process.exit(1);
     }
 
     // Close browser to finalize video
-    console.log('');
-    const closeSpinner = output.createSpinner('Finalizing video...');
-    closeSpinner.start();
+    bus?.emitPhase('composing', 'Finalizing video...');
+    let closeSpinner: ReturnType<typeof output.createSpinner> | undefined;
+    if (!bus) {
+      console.log('');
+      closeSpinner = output.createSpinner('Finalizing video...');
+      closeSpinner.start();
+    }
     const rawVideoPath = await session.close();
-    closeSpinner.succeed('Video finalized');
+    if (!bus) closeSpinner?.succeed('Video finalized');
 
     // Flush event log
     eventLog.flush();
@@ -226,9 +268,13 @@ export const recordCommand = new Command('record')
 
     // Post-process video
     if (rawVideoPath) {
-      console.log('');
-      const composeSpinner = output.createSpinner('Composing video with effects...');
-      composeSpinner.start();
+      bus?.emitPhase('composing', 'Composing video with effects...');
+      let composeSpinner: ReturnType<typeof output.createSpinner> | undefined;
+      if (!bus) {
+        console.log('');
+        composeSpinner = output.createSpinner('Composing video with effects...');
+        composeSpinner.start();
+      }
       try {
         const background: BackgroundOptions | undefined = opts.background
           ? {
@@ -249,7 +295,7 @@ export const recordCommand = new Command('record')
           cursor: true,
           background,
         });
-        composeSpinner.succeed('Video composed');
+        if (!bus) composeSpinner?.succeed('Video composed');
 
         // Generate thumbnail from composed video
         try {
@@ -261,16 +307,22 @@ export const recordCommand = new Command('record')
           // Non-fatal — upload proceeds without thumbnail
         }
       } catch (err) {
-        composeSpinner.warn(`Video composition skipped: ${err instanceof Error ? err.message : err}`);
+        if (!bus) composeSpinner?.warn(`Video composition skipped: ${err instanceof Error ? err.message : err}`);
       }
     }
 
     // Cloud upload
     let shareUrl: string | undefined;
+    let creditsUsed: number | undefined;
+    let creditsRemaining: number | undefined;
     if (!opts.local && isLoggedIn()) {
-      console.log('');
-      const uploadSpinner = output.createSpinner('Uploading to cloud...');
-      uploadSpinner.start();
+      bus?.emitPhase('uploading', 'Uploading to cloud...');
+      let uploadSpinner: ReturnType<typeof output.createSpinner> | undefined;
+      if (!bus) {
+        console.log('');
+        uploadSpinner = output.createSpinner('Uploading to cloud...');
+        uploadSpinner.start();
+      }
       try {
         const uploadResult = await uploadRecording(recDir, {
           id,
@@ -285,37 +337,54 @@ export const recordCommand = new Command('record')
           visibility: opts.unlisted ? 'unlisted' : 'public',
         });
         shareUrl = uploadResult.url;
-        uploadSpinner.succeed(`Uploaded: ${shareUrl}`);
+        if (!bus) uploadSpinner?.succeed(`Uploaded: ${shareUrl}`);
 
-        // Show credits remaining
+        // Get credits remaining
         try {
           const meRes = await apiRequest('/api/me');
           if (meRes.ok) {
             const me = await meRes.json() as { credits?: number };
             if (me.credits !== undefined) {
               const steps = result.stats.total_actions;
-              const creditsUsed = Math.ceil(steps / 10);
-              output.info(`${creditsUsed} credit${creditsUsed !== 1 ? 's' : ''} used (${steps} steps) \u00b7 ${me.credits} remaining`);
+              creditsUsed = Math.ceil(steps / 10);
+              creditsRemaining = me.credits;
+              if (!bus) {
+                output.info(`${creditsUsed} credit${creditsUsed !== 1 ? 's' : ''} used (${steps} steps) \u00b7 ${creditsRemaining} remaining`);
+              }
             }
           }
         } catch { /* ignore */ }
       } catch (err) {
-        uploadSpinner.warn(`Cloud upload skipped: ${err instanceof Error ? err.message : err}`);
+        if (!bus) uploadSpinner?.warn(`Cloud upload skipped: ${err instanceof Error ? err.message : err}`);
       }
     }
 
-    // Summary
-    console.log('');
-    output.header('Recording Complete');
-    output.stats('Summary', result.summary);
-    output.stats('Actions', result.stats.total_actions);
-    output.stats('Tokens (in/out)', `${result.stats.input_tokens} / ${result.stats.output_tokens}`);
-    output.stats('Duration', `${(eventLog.getDurationMs() / 1000).toFixed(1)}s`);
-    output.stats('Chapters', chapters.length);
-    output.stats('Output', recDir);
-    if (shareUrl) {
-      output.stats('Share URL', shareUrl);
+    // ── Done ──
+    if (bus) {
+      bus.emitDone({
+        summary: result.summary,
+        stats: result.stats,
+        shareUrl,
+        recDir,
+        durationMs: eventLog.getDurationMs(),
+        chapterCount: chapters.length,
+        creditsUsed,
+        creditsRemaining,
+      });
+      if (tuiExit) await tuiExit;
+    } else {
+      console.log('');
+      output.header('Recording Complete');
+      output.stats('Summary', result.summary);
+      output.stats('Actions', result.stats.total_actions);
+      output.stats('Tokens (in/out)', `${result.stats.input_tokens} / ${result.stats.output_tokens}`);
+      output.stats('Duration', `${(eventLog.getDurationMs() / 1000).toFixed(1)}s`);
+      output.stats('Chapters', chapters.length);
+      output.stats('Output', recDir);
+      if (shareUrl) {
+        output.stats('Share URL', shareUrl);
+      }
+      console.log('');
+      process.exit(0);
     }
-    console.log('');
-    process.exit(0);
   });

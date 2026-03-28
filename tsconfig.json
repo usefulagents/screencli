@@ -16,5 +16,5 @@
     "sourceMap": true
   },
   "include": ["bin/**/*.ts", "src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test", "src/tui"]
 }
