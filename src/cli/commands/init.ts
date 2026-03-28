@@ -5,6 +5,7 @@ import * as output from '../output.js';
 import { isLoggedIn, loadCloudConfig, saveCloudConfig } from '../../cloud/client.js';
 import { loginFlow } from '../../cloud/auth.js';
 import { isConfigured } from '../../utils/config.js';
+import { capture } from '../../utils/telemetry.js';
 
 function ask(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -74,6 +75,8 @@ export async function runInit(): Promise<boolean> {
   output.header('screencli setup');
   console.log('');
 
+  const isFirstRun = !isConfigured();
+
   // Already configured — skip
   if (isConfigured()) {
     if (isLoggedIn()) {
@@ -129,6 +132,12 @@ export async function runInit(): Promise<boolean> {
 
   // Offer skill installation
   await installSkill();
+
+  if (isFirstRun) {
+    capture('cli_first_run', {
+      auth_method: choice === '2' ? 'api_key' : 'cloud_login',
+    });
+  }
 
   return true;
 }

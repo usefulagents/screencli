@@ -6,6 +6,7 @@ import { readMetadata } from '../../recording/metadata.js';
 import { metadataPath, exportsDir, composedVideoPath } from '../../utils/paths.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { runExport } from '../../export/exporter.js';
+import { capture } from '../../utils/telemetry.js';
 import type { RecordingEvent } from '../../recording/types.js';
 
 export const exportCommand = new Command('export')
@@ -76,6 +77,11 @@ export const exportCommand = new Command('export')
         background,
       });
       spinner.succeed(`Exported: ${outputPath}`);
+      capture('video_exported', {
+        recording_id: metadata.id,
+        preset: opts.preset,
+        source: 'cli_export',
+      });
     } catch (err) {
       spinner.fail(`Export failed: ${err instanceof Error ? err.message : err}`);
       process.exit(1);

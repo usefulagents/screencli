@@ -37,6 +37,7 @@ import { logger, setLogLevel } from '../../utils/logger.js';
 import { isLoggedIn, apiRequest, validateToken, saveCloudConfig, loadCloudConfig } from '../../cloud/client.js';
 import { uploadRecording } from '../../cloud/upload.js';
 import { BACKGROUND_PRESETS, randomPreset } from '../../video/background.js';
+import { capture, shutdown as telemetryShutdown } from '../../utils/telemetry.js';
 
 const BACKGROUND_CHOICES = BACKGROUND_PRESETS;
 
@@ -75,6 +76,7 @@ export const recordCommand = new Command('record')
 
     // Auto-run init on first use
     if (!isConfigured()) {
+      capture('cli_installed');
       output.info('First time? Let\u2019s get you set up.\n');
       const ok = await runInit();
       if (!ok) {
@@ -192,6 +194,13 @@ export const recordCommand = new Command('record')
       storageState,
     });
     if (!bus) spinner?.succeed('Browser launched');
+
+    capture('recording_started', {
+      url,
+      model: opts.model,
+      headless: opts.headless !== false,
+      viewport: `${viewport.width}x${viewport.height}`,
+    });
 
     // Run agent loop
     const eventLog = new EventLog(eventsPath(recDir));
@@ -359,6 +368,16 @@ export const recordCommand = new Command('record')
       }
     }
 
+    capture('recording_completed', {
+      recording_id: id,
+      url,
+      duration_ms: eventLog.getDurationMs(),
+      total_actions: result.stats.total_actions,
+      tokens_input: result.stats.input_tokens,
+      tokens_output: result.stats.output_tokens,
+      uploaded: !!shareUrl,
+    });
+
     // ── Done ──
     if (bus) {
       bus.emitDone({
@@ -385,6 +404,7 @@ export const recordCommand = new Command('record')
         output.stats('Share URL', shareUrl);
       }
       console.log('');
+      await telemetryShutdown();
       process.exit(0);
     }
   });
