@@ -35,13 +35,21 @@ Do **not** use this skill for:
 
 ## Quick Start
 
+Set up screencli (one-time):
+
+```
+npx screencli init
+```
+
+This prompts you to sign in to screencli.sh (free credits, default) or paste your own Anthropic API key. It also offers to install the screencli skill for your coding agent.
+
 Record a demo and get a shareable link:
 
 ```
 npx screencli record https://example.com -p "Click the Sign Up button, fill in the form with test data, and submit"
 ```
 
-On first run, the CLI opens a browser for GitHub login automatically. After that, it records the session, applies effects, uploads, and prints a shareable URL.
+The AI agent navigates the page, the recording is composed with effects, uploaded, and you get a shareable URL.
 
 ## Recording
 
@@ -176,7 +184,7 @@ See [references/effects.md](references/effects.md) for gradient colors and the f
 
 | Problem | Fix |
 |---------|-----|
-| Not logged in | Run `npx screencli record` — login is triggered automatically |
+| Not logged in | Run `npx screencli init` to sign in or configure an API key |
 | FFmpeg missing | `brew install ffmpeg` (macOS) or see ffmpeg.org |
 | Auth expired | Re-run with `--login --auth <name>` |
 | Agent stuck or looping | Refine prompt, lower `--max-steps` |

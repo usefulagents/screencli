@@ -2,6 +2,20 @@
 
 ## Commands
 
+### init
+
+Set up screencli — sign in or configure an API key.
+
+```
+npx screencli init
+```
+
+Prompts to choose between:
+1. **Sign in to screencli.sh** (default) — free credits, cloud upload, no API key needed
+2. **Paste your own Anthropic API key** — direct API calls, local-only, no cloud features
+
+Also detects installed coding agents (Claude Code, Cursor) and offers to install the screencli skill.
+
 ### record
 
 Record an AI-driven browser demo.
@@ -141,7 +155,7 @@ Enqueues a server-side render job and polls until complete.
 
 **Location:** `~/.screencli/config.json`
 
-Stores authentication token, email, and plan after login. Login is triggered automatically on first `record`, or manually via `npx screencli login`.
+Stores authentication token, email, plan, and optionally an Anthropic API key. Run `npx screencli init` to set up, or it triggers automatically on first `record`.
 
 **Auth state:** `~/.screencli/auth/<name>.json`
 
