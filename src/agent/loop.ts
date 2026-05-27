@@ -9,6 +9,7 @@ import { AgentError } from '../utils/errors.js';
 import { isLoggedIn } from '../cloud/client.js';
 import { callAgentProxy } from '../cloud/agent-proxy.js';
 import type { AgentStats } from '../recording/types.js';
+import type { Verdict } from './tool-handlers.js';
 
 export interface AgentLoopOptions {
   apiKey: string;
@@ -22,11 +23,30 @@ export interface AgentLoopOptions {
   actionDelayMs: number;
   maxSteps: number;
   onAction?: (step: number, toolName: string, description: string) => void;
+  /**
+   * Force verdict mode: the `done` tool is hidden so the agent MUST end
+   * the run with `pass` or `fail`. Used by orchestrator-driven runs where
+   * a verdict is required for the PR comment to make sense.
+   */
+  requireVerdict?: boolean;
+  /**
+   * Optional auth setup the agent must perform BEFORE the main task.
+   * When set, the system prompt is amended with a two-phase structure:
+   *   Phase 1: AUTH — perform these instructions verbatim
+   *   Phase 2: TASK — carry out the user prompt
+   * If auth fails (e.g. credentials rejected), the agent should `fail()`
+   * the verdict with a reason that cites the auth blocker.
+   */
+  authInstructions?: string;
 }
 
 export interface AgentLoopResult {
   summary: string;
   stats: AgentStats;
+  /** Set when the agent called pass/fail. Absent for plain `done`. */
+  verdict?: Verdict;
+  /** The reason the agent supplied with pass/fail. */
+  reason?: string;
 }
 
 // Strip old screenshots from conversation to keep payloads small.
@@ -81,7 +101,19 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     options.actionDelayMs
   );
 
-  const systemPrompt = buildSystemPrompt(options.url, options.prompt);
+  const systemPrompt = buildSystemPrompt(
+    options.url,
+    options.prompt,
+    options.requireVerdict,
+    options.authInstructions,
+  );
+
+  // In verdict mode, hide the `done` tool so the agent is forced to use
+  // pass/fail. The Anthropic SDK doesn't error on unknown tool names if the
+  // model tries to call one — we just rely on the tool list to constrain.
+  const availableTools = options.requireVerdict
+    ? tools.filter((t) => t.name !== 'done')
+    : tools;
   const messages: Anthropic.MessageParam[] = [];
   let totalActions = 0;
   let inputTokens = 0;
@@ -130,13 +162,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
             recording_id: options.recording_id,
             url: options.url,
             prompt: options.prompt,
+            requireVerdict: options.requireVerdict,
+            authInstructions: options.authInstructions,
           }) as any;
         } else {
           response = await client!.messages.create({
             model: options.model,
             max_tokens: 1024,
             system: systemPrompt,
-            tools,
+            tools: availableTools,
             messages,
           });
         }
@@ -203,6 +237,8 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
           return {
             summary: result.summary ?? 'Task completed.',
             stats: { total_actions: totalActions, input_tokens: inputTokens, output_tokens: outputTokens },
+            verdict: result.verdict,
+            reason: result.reason,
           };
         }
       } catch (err) {
@@ -219,9 +255,22 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     messages.push({ role: 'user', content: toolResults });
   }
 
+  // ── maxSteps fallthrough ──
+  // The agent neither called done nor pass/fail within maxSteps actions.
+  // Return `inconclusive` so the recording lands cleanly with a real verdict
+  // (instead of leaving result.verdict undefined, which used to default to
+  // 'pass' in record.ts and stranded recordings in `uploading` when downstream
+  // compose/upload failed). For verdict-mode runs, this is the honest answer:
+  // we couldn't determine pass/fail in the time budget.
   logger.warn('Agent reached max steps limit.');
   return {
     summary: 'Agent reached maximum steps without completing.',
     stats: { total_actions: totalActions, input_tokens: inputTokens, output_tokens: outputTokens },
+    verdict: 'inconclusive',
+    reason:
+      `Agent reached max-steps (${options.maxSteps}) without calling ${
+        options.requireVerdict ? 'pass or fail' : 'done'
+      }. ` +
+      `The expectation may need a more focused prompt, or the page is hard to verify in this many steps.`,
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "screencli",
-  "version": "0.3.0",
+  "version": "0.3.3",
   "description": "AI-powered screen recording CLI tool",
   "type": "module",
   "bin": {
@@ -46,6 +46,7 @@
   },
   "files": [
     "dist",
+    "assets",
     "README.md",
     "LICENSE"
   ],

@@ -41,6 +41,12 @@ export const noShadowOption = new Option('--no-shadow', 'Disable drop shadow on 
 export const localOption = new Option('--local', 'Skip cloud upload even if logged in');
 export const unlistedOption = new Option('--unlisted', 'Upload but mark as unlisted (not shown on public profile)');
 
+// ── CI / verdict mode ──
+// --json emits a single JSON object on stdout (verdict, share_url, recording_id, …) and silences chalk/ora.
+// --ci enables non-interactive mode (fail fast on missing args, no stdin prompts). Auto-on when CI=true.
+export const jsonOption = new Option('--json', 'Emit a JSON result on stdout (silences progress output)');
+export const ciOption = new Option('--ci', 'Non-interactive mode for CI: fail fast on missing args, no spinners');
+
 export function parseViewport(value: string): { width: number; height: number } {
   const match = value.match(/^(\d+)x(\d+)$/);
   if (!match) throw new Error(`Invalid viewport format: ${value}. Expected WxH (e.g. 1920x1080)`);

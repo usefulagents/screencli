@@ -70,6 +70,24 @@ export async function runFFmpeg(options: FFmpegOptions): Promise<void> {
   });
 }
 
+/**
+ * Run ffmpeg with raw args. Useful for invocations that don't fit the
+ * single-input shape (e.g. `lavfi` sources, multi-pass mask generation).
+ */
+export async function runFFmpegRaw(args: string[]): Promise<void> {
+  logger.debug(`ffmpeg ${args.join(' ')}`);
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new FFmpegError(`FFmpeg exited with code ${code}:\n${stderr.slice(-500)}`));
+    });
+    proc.on('error', (err) => reject(new FFmpegError(`FFmpeg not found or failed to spawn: ${err.message}`)));
+  });
+}
+
 export async function getVideoDuration(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const proc = spawn('ffprobe', [

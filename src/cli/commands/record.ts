@@ -19,6 +19,8 @@ import {
   noShadowOption,
   localOption,
   unlistedOption,
+  jsonOption,
+  ciOption,
   parseViewport,
 } from '../options.js';
 import * as output from '../output.js';
@@ -34,7 +36,7 @@ import { runAgentLoop } from '../../agent/loop.js';
 import { composeVideo, generateThumbnail } from '../../video/compose.js';
 import type { BackgroundOptions } from '../../video/background.js';
 import { logger, setLogLevel } from '../../utils/logger.js';
-import { isLoggedIn, apiRequest, validateToken, saveCloudConfig, loadCloudConfig } from '../../cloud/client.js';
+import { isLoggedIn, apiRequest, validateToken, saveCloudConfig } from '../../cloud/client.js';
 import { uploadRecording } from '../../cloud/upload.js';
 import { BACKGROUND_PRESETS, randomPreset } from '../../video/background.js';
 import { capture, shutdown as telemetryShutdown } from '../../utils/telemetry.js';
@@ -49,6 +51,47 @@ function ask(question: string): Promise<string> {
       resolve(answer.trim());
     });
   });
+}
+
+/**
+ * The single JSON object CI parses. Emitted on stdout in --json mode.
+ * Kept stable on purpose — the GitHub Action and any other CI plumbing depend
+ * on these field names. Add new fields, don't rename existing ones.
+ */
+export interface FinalResult {
+  verdict: 'pass' | 'fail' | 'inconclusive';
+  reason?: string;
+  share_url?: string;
+  recording_id?: string;
+  step_count?: number;
+  duration_ms?: number;
+  tokens_input?: number;
+  tokens_output?: number;
+  summary?: string;
+}
+
+/** In --json mode, print one JSON object to stdout. Otherwise print human lines. */
+function emitFinalResult(jsonMode: boolean, result: FinalResult): void {
+  if (jsonMode) {
+    // Single line JSON so CI tools can `tail -1 | jq` reliably even if logs
+    // came out interleaved with this. (FFmpeg etc. write to stderr already.)
+    process.stdout.write(JSON.stringify(result) + '\n');
+    return;
+  }
+  output.header('Result');
+  output.stats('Verdict', result.verdict.toUpperCase());
+  if (result.reason) output.stats('Reason', result.reason);
+  if (result.share_url) output.stats('Share URL', result.share_url);
+  if (result.recording_id) output.stats('Recording ID', result.recording_id);
+  if (result.step_count !== undefined) output.stats('Steps', result.step_count);
+  if (result.duration_ms !== undefined) output.stats('Duration', `${(result.duration_ms / 1000).toFixed(1)}s`);
+}
+
+/** Map verdict to exit code. pass/done=0, fail=1, inconclusive=2, infra error=3. */
+function verdictExitCode(verdict: 'pass' | 'fail' | 'inconclusive' | undefined): number {
+  if (verdict === 'fail') return 1;
+  if (verdict === 'inconclusive') return 2;
+  return 0; // pass or no verdict (recording mode)
 }
 
 export const recordCommand = new Command('record')
@@ -70,12 +113,28 @@ export const recordCommand = new Command('record')
   .addOption(noShadowOption)
   .addOption(localOption)
   .addOption(unlistedOption)
+  .addOption(jsonOption)
+  .addOption(ciOption)
   .option('-v, --verbose', 'Verbose logging')
   .action(async (urlArg: string | undefined, opts: Record<string, any>) => {
     if (opts.verbose) setLogLevel('debug');
 
-    // Auto-run init on first use
-    if (!isConfigured()) {
+    // CI mode: triggered by --ci, --json, or CI=true env (so it Just Works in GitHub Actions).
+    // Implications: no interactive stdin prompts, no init wizard, no TUI/spinners. Plain logs.
+    const ciMode = Boolean(opts.ci || opts.json || process.env['CI']);
+    const jsonMode = Boolean(opts.json);
+
+    // SCREENCLI_TOKEN env var is the CI-friendly equivalent of `screencli login`.
+    // When set, save it as the cloud token before any cloud calls go out.
+    const envToken = process.env['SCREENCLI_TOKEN'];
+    if (envToken) {
+      try {
+        saveCloudConfig({ token: envToken });
+      } catch { /* non-fatal \u2014 falls back to file-based auth */ }
+    }
+
+    // Auto-run init on first use \u2014 but skip in CI mode (no TTY to walk a wizard)
+    if (!isConfigured() && !ciMode) {
       capture('cli_installed');
       output.info('First time? Let\u2019s get you set up.\n');
       const ok = await runInit();
@@ -83,11 +142,21 @@ export const recordCommand = new Command('record')
         output.error('Setup incomplete. Run `screencli init` to try again.');
         process.exit(1);
       }
+    } else if (!isConfigured() && ciMode && !envToken && !process.env['ANTHROPIC_API_KEY']) {
+      emitFinalResult(jsonMode, {
+        verdict: 'inconclusive',
+        reason: 'No SCREENCLI_TOKEN or ANTHROPIC_API_KEY set. CI runs need one of these.',
+      });
+      process.exit(3);
     }
 
     // ── Interactive prompts for missing params ──
     let url = urlArg ?? '';
     if (!url) {
+      if (ciMode) {
+        emitFinalResult(jsonMode, { verdict: 'inconclusive', reason: 'URL is required in CI mode.' });
+        process.exit(3);
+      }
       url = await ask('  URL to record: ');
       if (!url) {
         output.error('URL is required.');
@@ -96,6 +165,10 @@ export const recordCommand = new Command('record')
     }
 
     if (!opts.prompt) {
+      if (ciMode) {
+        emitFinalResult(jsonMode, { verdict: 'inconclusive', reason: 'Prompt (-p) is required in CI mode.' });
+        process.exit(3);
+      }
       opts.prompt = await ask('  What should the agent do? ');
       if (!opts.prompt) {
         output.error('Prompt is required.');
@@ -122,12 +195,15 @@ export const recordCommand = new Command('record')
 
     const config = loadConfig();
     const viewport = parseViewport(opts.viewport);
-    const id = uuidv4();
+    // SCREENCLI_RECORDING_ID is set by the cloud Sandbox dispatcher so the
+    // pre-created recording row in D1 lines up with the upload at the end.
+    const id = process.env['SCREENCLI_RECORDING_ID'] ?? uuidv4();
     const recDir = recordingDir(resolve(opts.output), id);
     const startTime = Date.now();
 
     // ── TUI or fallback ──
-    const isTTY = Boolean(process.stdout.isTTY);
+    // CI mode forces plain output regardless of TTY (Actions terminals report TTY but the TUI is wrong for logs)
+    const isTTY = Boolean(process.stdout.isTTY) && !ciMode;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let bus: any;
     let tuiExit: Promise<void> | undefined;
@@ -211,6 +287,17 @@ export const recordCommand = new Command('record')
       output.header('Agent Actions');
     }
 
+    // Orchestrator-driven runs need a verdict in the PR comment. When the
+    // dispatcher sets SCREENCLI_EXPECT_RUN_ID, force the agent into verdict
+    // mode — `done` is removed from the toolset so it must call pass/fail.
+    const requireVerdict = !!process.env['SCREENCLI_EXPECT_RUN_ID'];
+
+    // SCREENCLI_AUTH_INSTRUCTIONS is set by the orchestrator when the repo
+    // has authInstructions configured. The credentials are already
+    // substituted server-side; this is the resolved string the agent
+    // performs before the main task.
+    const authInstructions = process.env['SCREENCLI_AUTH_INSTRUCTIONS']?.trim() || undefined;
+
     let result;
     try {
       result = await runAgentLoop({
@@ -224,6 +311,8 @@ export const recordCommand = new Command('record')
         recordingDir: recDir,
         actionDelayMs: config.actionDelayMs,
         maxSteps: parseInt(opts.maxSteps, 10),
+        requireVerdict,
+        authInstructions,
         onAction: (step, toolName, description) => {
           if (bus) {
             bus.emitAction({ step, toolName, description, timestamp: Date.now() });
@@ -344,6 +433,19 @@ export const recordCommand = new Command('record')
           tokens_input: result.stats.input_tokens,
           tokens_output: result.stats.output_tokens,
           visibility: opts.unlisted ? 'unlisted' : 'public',
+          // ── CI context (all optional, set by the GitHub Action / webhook dispatcher) ──
+          // Pass through whatever the agent loop returned. Plain `done` (no
+          // verdict) still means a successful recording-mode run → pass.
+          // maxSteps fallthrough is now `inconclusive` (set inside loop.ts),
+          // so that propagates honestly here.
+          verdict: result.verdict ?? 'pass',
+          reason: result.reason ?? result.summary,
+          name: process.env['SCREENCLI_TEST_NAME'],
+          expect_run_id: process.env['SCREENCLI_EXPECT_RUN_ID'],
+          pr_number: process.env['SCREENCLI_PR_NUMBER'] ? Number(process.env['SCREENCLI_PR_NUMBER']) : undefined,
+          commit_sha: process.env['SCREENCLI_COMMIT_SHA'],
+          repo_full_name: process.env['SCREENCLI_REPO'],
+          installation_id: process.env['SCREENCLI_INSTALLATION_ID'] ? Number(process.env['SCREENCLI_INSTALLATION_ID']) : undefined,
         });
         shareUrl = uploadResult.url;
         if (!bus) uploadSpinner?.succeed(`Uploaded: ${shareUrl}`);
@@ -365,6 +467,30 @@ export const recordCommand = new Command('record')
         } catch { /* ignore */ }
       } catch (err) {
         if (!bus) uploadSpinner?.warn(`Cloud upload skipped: ${err instanceof Error ? err.message : err}`);
+
+        // Best-effort fallback: even if uploadRecording threw, try to flip
+        // the recording row from `uploading` → `ready` (or carry the verdict)
+        // via a direct /confirm POST. Without this, expect-run-driven
+        // recordings strand the parent run in `running` forever because
+        // recomputeAndMaybeFinalize only fires from /confirm.
+        try {
+          await apiRequest(`/api/recordings/${id}/confirm`, {
+            method: 'POST',
+            body: JSON.stringify({
+              duration_ms: eventLog.getDurationMs(),
+              tokens_input: result.stats.input_tokens,
+              tokens_output: result.stats.output_tokens,
+              verdict: result.verdict ?? 'inconclusive',
+              reason: result.reason ?? `Upload failed after agent completed: ${err instanceof Error ? err.message : String(err)}`,
+              name: process.env['SCREENCLI_TEST_NAME'],
+              expect_run_id: process.env['SCREENCLI_EXPECT_RUN_ID'],
+              pr_number: process.env['SCREENCLI_PR_NUMBER'] ? Number(process.env['SCREENCLI_PR_NUMBER']) : undefined,
+              commit_sha: process.env['SCREENCLI_COMMIT_SHA'],
+              repo_full_name: process.env['SCREENCLI_REPO'],
+              installation_id: process.env['SCREENCLI_INSTALLATION_ID'] ? Number(process.env['SCREENCLI_INSTALLATION_ID']) : undefined,
+            }),
+          });
+        } catch { /* nothing more we can do from here */ }
       }
     }
 
@@ -391,20 +517,37 @@ export const recordCommand = new Command('record')
         creditsRemaining,
       });
       if (tuiExit) await tuiExit;
-    } else {
+      return;
+    }
+
+    // Plain / CI mode: emit a final result. In --json mode this is a single
+    // JSON line on stdout; otherwise it's a human-readable block. Either way
+    // the exit code reflects the verdict (pass=0, fail=1, inconclusive=2, infra=3).
+    const finalVerdict = result.verdict ?? 'pass'; // recording mode (done) = pass
+    emitFinalResult(jsonMode, {
+      verdict: finalVerdict,
+      reason: result.reason ?? result.summary,
+      share_url: shareUrl,
+      recording_id: id,
+      step_count: result.stats.total_actions,
+      duration_ms: eventLog.getDurationMs(),
+      tokens_input: result.stats.input_tokens,
+      tokens_output: result.stats.output_tokens,
+      summary: result.summary,
+    });
+
+    if (!jsonMode) {
+      // Keep the human-friendly extras (chapters, output dir, credits) outside the
+      // structured Result block above.
       console.log('');
-      output.header('Recording Complete');
-      output.stats('Summary', result.summary);
-      output.stats('Actions', result.stats.total_actions);
-      output.stats('Tokens (in/out)', `${result.stats.input_tokens} / ${result.stats.output_tokens}`);
-      output.stats('Duration', `${(eventLog.getDurationMs() / 1000).toFixed(1)}s`);
-      output.stats('Chapters', chapters.length);
       output.stats('Output', recDir);
-      if (shareUrl) {
-        output.stats('Share URL', shareUrl);
+      output.stats('Chapters', chapters.length);
+      if (creditsRemaining !== undefined) {
+        output.stats('Credits remaining', creditsRemaining);
       }
       console.log('');
-      await telemetryShutdown();
-      process.exit(0);
     }
+
+    await telemetryShutdown();
+    process.exit(verdictExitCode(result.verdict));
   });

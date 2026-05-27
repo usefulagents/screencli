@@ -9,8 +9,20 @@ export async function callAgentProxy(options: {
   recording_id?: string;
   url?: string;
   prompt?: string;
+  /**
+   * When true, the proxy uses a verdict-mode prompt + swaps `done` for
+   * `pass`/`fail` tools. Forwarded from `runAgentLoop({ requireVerdict })`.
+   */
+  requireVerdict?: boolean;
+  /**
+   * Pre-resolved auth instructions to prepend as Phase 1 of the agent's
+   * task. Already has {{email}}/{{password}} substituted by the orchestrator.
+   */
+  authInstructions?: string;
 }): Promise<any> {
-  // Only send messages, recording_id, and metadata — server controls model, system, tools
+  // Only send messages, recording_id, and metadata — server controls model,
+  // system, tools. `requireVerdict` is the one server-honored signal: it picks
+  // which server-controlled prompt/tools to use.
   const res = await apiRequest('/api/agent/messages', {
     method: 'POST',
     body: JSON.stringify({
@@ -19,6 +31,8 @@ export async function callAgentProxy(options: {
       url: options.url,
       prompt: options.prompt,
       stream: false,
+      requireVerdict: options.requireVerdict,
+      authInstructions: options.authInstructions,
     }),
   });
 

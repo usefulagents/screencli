@@ -8,10 +8,14 @@ import { join } from 'node:path';
 import type { ElementTarget } from '../browser/resolve-locator.js';
 import type { Viewport } from '../recording/types.js';
 
+export type Verdict = 'pass' | 'fail' | 'inconclusive';
+
 export interface ToolResult {
   content: Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }>;
   isDone?: boolean;
   summary?: string;
+  verdict?: Verdict;
+  reason?: string;
 }
 
 export class ToolHandlers {
@@ -61,6 +65,10 @@ export class ToolHandlers {
         return this.handleSelectOption(input);
       case 'done':
         return this.handleDone(input);
+      case 'pass':
+        return this.handleVerdict('pass', input);
+      case 'fail':
+        return this.handleVerdict('fail', input);
       case 'narrate':
         return this.handleNarrate(input);
       default:
@@ -300,6 +308,24 @@ export class ToolHandlers {
       content: [{ type: 'text', text: `Recording complete: ${input.summary}` }],
       isDone: true,
       summary: input.summary,
+    };
+  }
+
+  private async handleVerdict(verdict: 'pass' | 'fail', input: Record<string, any>): Promise<ToolResult> {
+    const reason = String(input.reason ?? '');
+    this.eventLog.append({
+      type: 'done',
+      description: `${verdict.toUpperCase()}: ${reason}`,
+      viewport: this.viewport(),
+      url: this.page.url(),
+    });
+    this.eventLog.flush();
+    return {
+      content: [{ type: 'text', text: `Verdict recorded: ${verdict} — ${reason}` }],
+      isDone: true,
+      summary: reason,
+      verdict,
+      reason,
     };
   }
 

@@ -20,6 +20,16 @@ export async function uploadRecording(
     tokens_input?: number;
     tokens_output?: number;
     visibility?: string;
+    // ── Optional verdict + CI context. Forwarded to /api/recordings server-side
+    //    so the recording can be joined back to a PR / expect run.
+    verdict?: 'pass' | 'fail' | 'inconclusive';
+    reason?: string;
+    name?: string;
+    expect_run_id?: string;
+    pr_number?: number;
+    commit_sha?: string;
+    repo_full_name?: string;
+    installation_id?: number;
   }
 ): Promise<UploadResult> {
   // Create the recording entry on the server
@@ -43,38 +53,66 @@ export async function uploadRecording(
     { type: "thumbnail", localPath: path.join(recordingDir, "thumbnail.jpg") },
   ];
 
+  // Upload files — defensive. Individual file failures (network blip,
+  // missing local file, oversized body) must NOT prevent the confirm step
+  // from running, because confirm is what:
+  //   1. Flips the recording's status from `uploading` → `ready` in D1
+  //   2. Carries the verdict to /api/recordings/:id/confirm
+  //   3. Triggers `recomputeAndMaybeFinalize` on the parent expect_run
+  // Stranding a recording in `uploading` blocks the entire expect_run from
+  // finalizing — so we always reach confirm, with a best-effort body.
+  let uploadFailures = 0;
   for (const file of files) {
-    if (fs.existsSync(file.localPath)) {
-      const data = fs.readFileSync(file.localPath);
+    try {
+      if (!fs.existsSync(file.localPath)) continue;
       const uploadPath = upload_urls[file.type];
-      if (uploadPath) {
-        const uploadRes = await apiRequest(uploadPath, {
-          method: "PUT",
-          body: data,
-          headers: {
-            "Content-Type": "application/octet-stream",
-          },
-        });
-
-        if (!uploadRes.ok) {
-          console.error(`  ⚠ Failed to upload ${file.type}`);
-        }
+      if (!uploadPath) continue;
+      const data = fs.readFileSync(file.localPath);
+      const uploadRes = await apiRequest(uploadPath, {
+        method: "PUT",
+        body: data,
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+      if (!uploadRes.ok) {
+        uploadFailures++;
+        console.error(`  ⚠ Failed to upload ${file.type} (HTTP ${uploadRes.status})`);
       }
+    } catch (err) {
+      uploadFailures++;
+      console.error(`  ⚠ Failed to upload ${file.type}:`, err instanceof Error ? err.message : err);
     }
   }
 
-  // Confirm upload
+  // If we got here with NO files uploaded AND no verdict, downgrade to
+  // inconclusive so the recording lands honestly rather than claiming success.
+  let finalVerdict = metadata.verdict;
+  let finalReason = metadata.reason;
+  if (uploadFailures > 0 && finalVerdict === undefined) {
+    finalVerdict = 'inconclusive';
+    finalReason = `${uploadFailures} file upload(s) failed during recording finalization.`;
+  }
+
+  // Confirm — always fires, even when some/all file uploads failed.
+  // The verdict + CI context land in D1 so the orchestrator can finalize.
   const confirmRes = await apiRequest(`/api/recordings/${id}/confirm`, {
     method: "POST",
     body: JSON.stringify({
       duration_ms: metadata.duration_ms,
       tokens_input: metadata.tokens_input,
       tokens_output: metadata.tokens_output,
+      verdict: finalVerdict,
+      reason: finalReason,
+      name: metadata.name,
+      expect_run_id: metadata.expect_run_id,
+      pr_number: metadata.pr_number,
+      commit_sha: metadata.commit_sha,
+      repo_full_name: metadata.repo_full_name,
+      installation_id: metadata.installation_id,
     }),
   });
 
   if (!confirmRes.ok) {
-    throw new Error("Failed to confirm upload");
+    throw new Error(`Failed to confirm upload: HTTP ${confirmRes.status}`);
   }
 
   const result = await confirmRes.json() as { url: string };

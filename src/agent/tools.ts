@@ -133,11 +133,33 @@ export const tools: ToolDef[] = [
   // ── Control ──
   {
     name: 'done',
-    description: 'Task complete.',
+    description: 'Task complete (neutral outcome). Use this for demo/recording prompts that just describe a flow to walk through. For verification prompts ("expect", "verify", "check"), use pass or fail instead.',
     input_schema: {
       type: 'object',
       properties: { summary: { type: 'string', description: 'What was accomplished.' } },
       required: ['summary'],
+    },
+  },
+  {
+    name: 'pass',
+    description: 'The prompt described an expectation/assertion AND it held up. Use this in verification mode when you confirmed the expected behavior. Includes a short reason citing what you observed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reason: { type: 'string', description: 'What you verified, in one or two sentences. Cite concrete evidence (e.g. "Dashboard rendered with 3 widgets and no console errors").' },
+      },
+      required: ['reason'],
+    },
+  },
+  {
+    name: 'fail',
+    description: 'The prompt described an expectation/assertion AND it did NOT hold up. Use this only when you have concrete evidence of failure (error message, missing element, wrong value). Do NOT use fail just because the page is slow — wait first.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reason: { type: 'string', description: 'What went wrong, in one or two sentences. Cite concrete evidence (e.g. "Login form rejected valid credentials with `Invalid email` error").' },
+      },
+      required: ['reason'],
     },
   },
   {
