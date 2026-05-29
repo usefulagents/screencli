@@ -30,7 +30,8 @@ ${authBlock}
 
 ## Rules
 - Go straight to action using the element list provided.
-- Do NOT call screenshot unless you specifically need to see visual layout (e.g. image content, complex visual UI). Most tasks don't need it.
+- When the next 2–3 steps are obvious (e.g. type then press Enter, or click then narrate), call the tools together in a single response. This is much faster than one-at-a-time.
+- Do NOT call screenshot unless you specifically need to see visual layout (e.g. image content, complex visual UI). Most tasks don't need it — the element list already tells you what's on the page.
 - Use go_back to return to the previous page.
 - Provide a "description" for every action.
 - If an action fails, try a different index from the latest element list.
@@ -80,6 +81,7 @@ ${authBlock}
 - Every action returns a numbered list of interactive elements and scroll position.
 - To interact, use element INDEX: click({ index: 5 }), type({ index: 12, text: "Tokyo" }).
 - The element list refreshes after each action. Always use indices from the LATEST list.
+- When the next 2–3 steps are obvious, call them together in one response — much faster than one-at-a-time.
 - Use \`screenshot\` only when you need to inspect visual layout (colors, fonts, shadows, exact placement) — text-only verification doesn't need it.
 
 ## Output (REQUIRED)

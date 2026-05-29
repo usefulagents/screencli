@@ -49,9 +49,25 @@ export interface AgentLoopResult {
   reason?: string;
 }
 
+// Visual-verification keyword detector — when the prompt mentions visual
+// properties we keep the `screenshot` tool available. Otherwise we hide it,
+// because offering it tempts the model to call it for navigation flows that
+// don't need vision. Mirrors the same list in the cloud proxy.
+const VISUAL_KEYWORDS = [
+  'look', 'looks', 'color', 'colour', 'style', 'styled',
+  'appear', 'appears', 'appearance', 'visible', 'visual',
+  'design', 'layout', 'chart', 'graph', 'image', 'photo',
+  'icon', 'logo', 'font', 'shadow', 'render', 'rendered',
+  'screenshot', 'see', 'shown', 'displayed', 'background',
+];
+function promptNeedsVision(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  return VISUAL_KEYWORDS.some((kw) => p.includes(kw));
+}
+
 // Strip old screenshots from conversation to keep payloads small.
 // Keeps only the last N screenshots, replacing older ones with a text placeholder.
-function trimOldScreenshots(messages: Anthropic.MessageParam[], keepLast: number = 2): void {
+function trimOldScreenshots(messages: Anthropic.MessageParam[], keepLast: number = 1): void {
   let imageCount = 0;
   // Count total images (reverse scan)
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -111,9 +127,30 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   // In verdict mode, hide the `done` tool so the agent is forced to use
   // pass/fail. The Anthropic SDK doesn't error on unknown tool names if the
   // model tries to call one — we just rely on the tool list to constrain.
-  const availableTools = options.requireVerdict
+  //
+  // Additionally, hide `screenshot` unless the prompt explicitly mentions
+  // visual properties. The element list is sufficient for navigation, and
+  // offering vision causes the model to call it speculatively, which is
+  // the main source of slowness users complain about.
+  const needsVision = promptNeedsVision(options.prompt);
+  let availableTools = options.requireVerdict
     ? tools.filter((t) => t.name !== 'done')
     : tools;
+  if (!needsVision) {
+    availableTools = availableTools.filter((t) => t.name !== 'screenshot');
+  }
+  // Prompt caching: within a single recording, system + tools are identical
+  // across every step. A single cache breakpoint on the last tool caches
+  // both — cutting input tokens for steps 2..N by ~80% and shaving latency.
+  // Cache TTL is 5 min, which comfortably covers a recording session.
+  const cachedTools = availableTools.map((t, i) =>
+    i === availableTools.length - 1
+      ? ({ ...t, cache_control: { type: 'ephemeral' as const } } as any)
+      : t,
+  );
+  const cachedSystem = [
+    { type: 'text' as const, text: systemPrompt, cache_control: { type: 'ephemeral' as const } },
+  ];
   const messages: Anthropic.MessageParam[] = [];
   let totalActions = 0;
   let inputTokens = 0;
@@ -169,8 +206,8 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
           response = await client!.messages.create({
             model: options.model,
             max_tokens: 1024,
-            system: systemPrompt,
-            tools: availableTools,
+            system: cachedSystem as any,
+            tools: cachedTools,
             messages,
           });
         }
