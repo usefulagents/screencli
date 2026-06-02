@@ -35,9 +35,10 @@ import { deriveChapters } from '../../recording/chapters.js';
 import { runAgentLoop } from '../../agent/loop.js';
 import { composeVideo, generateThumbnail } from '../../video/compose.js';
 import type { BackgroundOptions } from '../../video/background.js';
-import { logger, setLogLevel } from '../../utils/logger.js';
+import { logger, setLogLevel, addLogSink } from '../../utils/logger.js';
 import { isLoggedIn, apiRequest, validateToken, saveCloudConfig } from '../../cloud/client.js';
 import { uploadRecording } from '../../cloud/upload.js';
+import { LogShipper } from '../../cloud/log-shipper.js';
 import { BACKGROUND_PRESETS, randomPreset } from '../../video/background.js';
 import { capture, shutdown as telemetryShutdown } from '../../utils/telemetry.js';
 
@@ -201,6 +202,23 @@ export const recordCommand = new Command('record')
     const recDir = recordingDir(resolve(opts.output), id);
     const startTime = Date.now();
 
+    // ── Consolidated run logs ──
+    // When the run will reach the cloud, capture every log line (agentic +
+    // compose/close/upload) and ship it per-recording, advancing the status
+    // phase as we go. Best-effort: a shipping failure never affects the run.
+    let logShipper: LogShipper | undefined;
+    let removeLogSink: (() => void) | undefined;
+    if (!opts.local && isLoggedIn()) {
+      logShipper = new LogShipper(id);
+      removeLogSink = addLogSink((line) => logShipper!.add(line));
+      logShipper.start();
+    }
+    const stopLogShipper = async (): Promise<void> => {
+      await logShipper?.flush();
+      logShipper?.stop();
+      removeLogSink?.();
+    };
+
     // ── TUI or fallback ──
     // CI mode forces plain output regardless of TTY (Actions terminals report TTY but the TUI is wrong for logs)
     const isTTY = Boolean(process.stdout.isTTY) && !ciMode;
@@ -329,9 +347,17 @@ export const recordCommand = new Command('record')
         output.error(`Agent error: ${err}`);
       }
       eventLog.flush();
+      // Ship the agent logs (incl. this failure) before exiting so a crashed
+      // loop is debuggable from the recording's log feed.
+      await stopLogShipper();
       await session.close();
       process.exit(1);
     }
+
+    // Agent loop is done — everything from here is the post-agent pipeline
+    // (compose, browser close, upload). Flip the phase so a stuck run is
+    // attributable to the pipeline rather than the loop.
+    await logShipper?.setPhase('processing');
 
     // Close browser to finalize video
     bus?.emitPhase('composing', 'Finalizing video...');
@@ -423,6 +449,10 @@ export const recordCommand = new Command('record')
     let creditsUsed: number | undefined;
     let creditsRemaining: number | undefined;
     if (!opts.local && isLoggedIn()) {
+      await logShipper?.setPhase('uploading');
+      // Snapshot the full log to disk so it uploads to R2 alongside the other
+      // artifacts (the live D1 ring buffer still captures upload-phase lines).
+      logShipper?.dumpTo(resolve(recDir, 'logs.txt'));
       bus?.emitPhase('uploading', 'Uploading to cloud...');
       let uploadSpinner: ReturnType<typeof output.createSpinner> | undefined;
       if (!bus) {
@@ -502,6 +532,9 @@ export const recordCommand = new Command('record')
         } catch { /* nothing more we can do from here */ }
       }
     }
+
+    // Ship any remaining buffered log lines, then stop the shipper.
+    await stopLogShipper();
 
     capture('recording_completed', {
       recording_id: id,

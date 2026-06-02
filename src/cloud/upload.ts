@@ -51,6 +51,7 @@ export async function uploadRecording(
     { type: "raw", localPath: path.join(recordingDir, "raw.webm") },
     { type: "events", localPath: path.join(recordingDir, "events.json") },
     { type: "thumbnail", localPath: path.join(recordingDir, "thumbnail.jpg") },
+    { type: "logs", localPath: path.join(recordingDir, "logs.txt") },
   ];
 
   // Upload files — defensive. Individual file failures (network blip,
