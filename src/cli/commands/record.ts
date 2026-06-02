@@ -341,8 +341,17 @@ export const recordCommand = new Command('record')
       closeSpinner = output.createSpinner('Finalizing video...');
       closeSpinner.start();
     }
-    const rawVideoPath = await session.close();
-    if (!bus) closeSpinner?.succeed('Video finalized');
+    // A hung/failed finalize must not abort the run — without a verdict the
+    // recording strands in `uploading`. Swallow the error so the upload +
+    // /confirm fallback below still fires; we just lose the composed video.
+    let rawVideoPath: string | undefined;
+    try {
+      rawVideoPath = await session.close();
+      if (!bus) closeSpinner?.succeed('Video finalized');
+    } catch (err) {
+      if (!bus) closeSpinner?.warn(`Video finalize failed: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`session.close() failed — proceeding to upload without composed video: ${err}`);
+    }
 
     // Flush event log
     eventLog.flush();

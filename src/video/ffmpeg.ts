@@ -1,6 +1,33 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { FFmpegError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
+
+// A spawned ffmpeg/ffprobe that wedges (malformed input, a stalled filter, a
+// not-cleanly-finalized raw video) would otherwise hang the CLI forever — the
+// process never emits `close`, so the promise never settles, and the recording
+// strands in `uploading` with no verdict. These timeouts kill the process so
+// the promise rejects and the caller's try/catch + /confirm fallback can run.
+// Override via env for ops tuning.
+const FFMPEG_TIMEOUT_MS = Number(process.env['SCREENCLI_FFMPEG_TIMEOUT_MS']) || 120_000;
+const FFPROBE_TIMEOUT_MS = Number(process.env['SCREENCLI_FFPROBE_TIMEOUT_MS']) || 30_000;
+
+/**
+ * Arm a watchdog that SIGKILLs a stuck process and rejects. Returns a function
+ * to disarm it — call from both the `close` and `error` handlers.
+ */
+function armKillTimer(
+  proc: ChildProcess,
+  label: string,
+  ms: number,
+  reject: (err: Error) => void,
+): () => void {
+  const timer = setTimeout(() => {
+    logger.error(`${label} exceeded ${ms}ms — killing process.`);
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    reject(new FFmpegError(`${label} timed out after ${ms}ms`));
+  }, ms);
+  return () => clearTimeout(timer);
+}
 
 export interface FFmpegOptions {
   input: string;
@@ -39,6 +66,7 @@ export async function runFFmpeg(options: FFmpegOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
+    const disarm = armKillTimer(proc, 'FFmpeg', FFMPEG_TIMEOUT_MS, reject);
 
     proc.stderr?.on('data', (data: Buffer) => {
       const text = data.toString();
@@ -57,6 +85,7 @@ export async function runFFmpeg(options: FFmpegOptions): Promise<void> {
     });
 
     proc.on('close', (code) => {
+      disarm();
       if (code === 0) {
         resolve();
       } else {
@@ -65,6 +94,7 @@ export async function runFFmpeg(options: FFmpegOptions): Promise<void> {
     });
 
     proc.on('error', (err) => {
+      disarm();
       reject(new FFmpegError(`FFmpeg not found or failed to spawn: ${err.message}`));
     });
   });
@@ -79,12 +109,14 @@ export async function runFFmpegRaw(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
+    const disarm = armKillTimer(proc, 'FFmpeg', FFMPEG_TIMEOUT_MS, reject);
     proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
     proc.on('close', (code) => {
+      disarm();
       if (code === 0) resolve();
       else reject(new FFmpegError(`FFmpeg exited with code ${code}:\n${stderr.slice(-500)}`));
     });
-    proc.on('error', (err) => reject(new FFmpegError(`FFmpeg not found or failed to spawn: ${err.message}`)));
+    proc.on('error', (err) => { disarm(); reject(new FFmpegError(`FFmpeg not found or failed to spawn: ${err.message}`)); });
   });
 }
 
@@ -98,11 +130,13 @@ export async function getVideoDuration(filePath: string): Promise<number> {
     ]);
 
     let stdout = '';
+    const disarm = armKillTimer(proc, 'ffprobe', FFPROBE_TIMEOUT_MS, reject);
     proc.stdout?.on('data', (data: Buffer) => {
       stdout += data.toString();
     });
 
     proc.on('close', (code) => {
+      disarm();
       if (code === 0) {
         resolve(parseFloat(stdout.trim()));
       } else {
@@ -111,6 +145,7 @@ export async function getVideoDuration(filePath: string): Promise<number> {
     });
 
     proc.on('error', (err) => {
+      disarm();
       reject(new FFmpegError(`ffprobe not found: ${err.message}`));
     });
   });

@@ -5,6 +5,22 @@ import { BrowserError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import type { Viewport } from '../recording/types.js';
 
+// Playwright finalizes the recorded video on context.close(); a malformed or
+// not-cleanly-finalized stream can wedge that call forever, stranding the
+// recording in `uploading` with no verdict. This timeout makes close() reject
+// so record.ts's try/catch + /confirm fallback can run. Override via env.
+const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env['SCREENCLI_BROWSER_CLOSE_TIMEOUT_MS']) || 60_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new BrowserError(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export interface BrowserSession {
   browser: Browser;
   context: BrowserContext;
@@ -44,8 +60,8 @@ export async function launchSession(options: {
   async function close(): Promise<string | undefined> {
     try {
       // Must close context to finalize video
-      await context.close();
-      await browser.close();
+      await withTimeout(context.close(), BROWSER_CLOSE_TIMEOUT_MS, 'context.close (video finalize)');
+      await withTimeout(browser.close(), BROWSER_CLOSE_TIMEOUT_MS, 'browser.close');
 
       // Playwright saves video as a random name in recordDir; find and rename it
       const files = readdirSync(options.recordDir).filter((f) => f.endsWith('.webm'));
