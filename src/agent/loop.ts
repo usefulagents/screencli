@@ -57,6 +57,38 @@ const NUDGE_AFTER_NO_PROGRESS = 2;   // inject a course-correction message
 const BAIL_AFTER_NO_PROGRESS = 5;    // give up and return inconclusive
 const LOW_STEPS_REMAINING = 8;       // start telling the agent to converge
 
+// Wall-clock safety nets. A single tool call (Playwright action + element
+// re-scan) should never take this long — if it does, the browser is wedged
+// (e.g. a click triggered a navigation/reload that never settles), and the
+// loop would otherwise hang forever with no API activity until the 15-min
+// server-side watchdog force-finalizes the run with NO video. These bound the
+// loop so it always RETURNS, letting the CLI compose + upload whatever video
+// exists and POST an honest `inconclusive` verdict.
+// Override via env for ops tuning.
+const STEP_TIMEOUT_MS = Number(process.env['SCREENCLI_STEP_TIMEOUT_MS']) || 60_000;
+const RUN_DEADLINE_MS = Number(process.env['SCREENCLI_RUN_DEADLINE_MS']) || 10 * 60_000;
+
+/** Thrown when a single tool call exceeds STEP_TIMEOUT_MS. */
+class StepTimeoutError extends Error {}
+
+/**
+ * Race a promise against a timeout. If the timeout wins we reject (so the
+ * caller unblocks), but we still attach handlers to the original promise so a
+ * late rejection doesn't surface as an unhandled rejection.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new StepTimeoutError(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 function fingerprintToolResults(toolResults: Anthropic.ToolResultBlockParam[]): string {
   const text = toolResults
     .flatMap((r) => (Array.isArray(r.content) ? r.content : []))
@@ -135,6 +167,14 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   let noProgressStreak = 0;
   let lastActionLabel = '';
 
+  // Wall-clock safety nets (see STEP_TIMEOUT_MS / RUN_DEADLINE_MS).
+  const runStart = Date.now();
+  const runDeadlineAt = runStart + RUN_DEADLINE_MS;
+  logger.info(
+    `Agent budget: ${options.maxSteps} steps, ${(RUN_DEADLINE_MS / 1000).toFixed(0)}s run deadline, ` +
+      `${(STEP_TIMEOUT_MS / 1000).toFixed(0)}s per-step timeout.`,
+  );
+
   // Initial observation: navigate to URL
   logger.info(`Navigating to ${options.url}`);
   await options.page.goto(options.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -150,7 +190,11 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
 
   // Send element list only (no vision) — agent can act immediately
   const { getInteractiveElements } = await import('../browser/accessibility.js');
-  const { formatted: initialElements } = await getInteractiveElements(options.page);
+  const { formatted: initialElements } = await withTimeout(
+    getInteractiveElements(options.page),
+    STEP_TIMEOUT_MS,
+    'initial element scan',
+  );
   messages.push({
     role: 'user',
     content: [
@@ -162,7 +206,29 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
   });
 
   for (let step = 0; step < options.maxSteps; step++) {
-    logger.debug(`Agent step ${step + 1}/${options.maxSteps}`);
+    const runElapsedMs = Date.now() - runStart;
+    logger.debug(`Agent step ${step + 1}/${options.maxSteps} (run elapsed ${(runElapsedMs / 1000).toFixed(0)}s)`);
+
+    // ── Overall run deadline ──
+    // Backstop for slow-but-not-hung runs (many near-timeout steps, a slow
+    // proxy, etc.). Returning here lets the CLI still compose + upload the
+    // partial video and POST a verdict, instead of the 15-min server watchdog
+    // killing the run with no video.
+    if (runElapsedMs > RUN_DEADLINE_MS) {
+      logger.error(
+        `Agent hit run deadline (${(RUN_DEADLINE_MS / 1000).toFixed(0)}s) at step ${step + 1}. ` +
+          `Finalizing as inconclusive. Last action: ${lastActionLabel || 'n/a'}.`,
+      );
+      return {
+        summary: 'Agent exceeded the overall time budget.',
+        stats: { total_actions: totalActions, input_tokens: inputTokens, output_tokens: outputTokens },
+        verdict: 'inconclusive',
+        reason:
+          `Agent exceeded the run deadline (${(RUN_DEADLINE_MS / 1000).toFixed(0)}s) at step ${step + 1}/${options.maxSteps}` +
+          (lastActionLabel ? ` (last action: ${lastActionLabel})` : '') +
+          `. The page may be slow or the run too complex for the time budget.`,
+      };
+    }
 
     // Trim old screenshots to keep payload small and API calls fast
     trimOldScreenshots(messages);
@@ -171,19 +237,25 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     const MAX_RETRIES = 3;
     for (let attempt = 0; ; attempt++) {
       try {
-        response = await callAgentProxy({
-          messages: messages as any,
-          model: options.model,
-          recording_id: options.recording_id,
-          url: options.url,
-          prompt: options.prompt,
-          requireVerdict: options.requireVerdict,
-          authInstructions: options.authInstructions,
-        }) as any;
+        response = await withTimeout(
+          callAgentProxy({
+            messages: messages as any,
+            model: options.model,
+            recording_id: options.recording_id,
+            url: options.url,
+            prompt: options.prompt,
+            requireVerdict: options.requireVerdict,
+            authInstructions: options.authInstructions,
+          }) as Promise<Anthropic.Message>,
+          STEP_TIMEOUT_MS,
+          'agent proxy call',
+        );
         break;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        const isRetryable = msg.includes('429') || msg.includes('529') || msg.includes('overloaded');
+        const isRetryable =
+          err instanceof StepTimeoutError ||
+          msg.includes('429') || msg.includes('529') || msg.includes('overloaded');
         if (isRetryable && attempt < MAX_RETRIES) {
           const waitMs = Math.min(1000 * 2 ** attempt, 15_000);
           logger.warn(`Retryable error (attempt ${attempt + 1}/${MAX_RETRIES}): ${msg}. Retrying in ${waitMs}ms...`);
@@ -231,8 +303,18 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       logger.info(`[${step + 1}] ${toolUse.name}: ${description}`);
       lastActionLabel = `${toolUse.name} (${String(description)})`;
 
+      const toolStart = Date.now();
       try {
-        const result = await handlers.handle(toolUse.name, toolUse.input as Record<string, any>);
+        // Per-step timeout: if a single action wedges (most often a click that
+        // kicks off a navigation/reload that never settles), abort the whole
+        // run rather than hang. STEP_TIMEOUT_MS is far above any individual
+        // Playwright timeout, so this only trips on a genuinely stuck browser.
+        const result = await withTimeout(
+          handlers.handle(toolUse.name, toolUse.input as Record<string, any>),
+          STEP_TIMEOUT_MS,
+          `[${step + 1}] ${toolUse.name}`,
+        );
+        logger.info(`[${step + 1}] ${toolUse.name} ✓ ${Date.now() - toolStart}ms`);
 
         toolResults.push({
           type: 'tool_result',
@@ -249,7 +331,26 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
           };
         }
       } catch (err) {
-        logger.warn(`Tool ${toolUse.name} failed: ${err}`);
+        if (err instanceof StepTimeoutError) {
+          // The browser is wedged. There's no point continuing — subsequent
+          // actions will hit the same dead context. Finalize now so the CLI
+          // can still upload the partial video + verdict. The reason names the
+          // tool + elapsed so the hang is debuggable from the DB afterward.
+          const elapsedMs = Date.now() - toolStart;
+          logger.error(
+            `[${step + 1}] ${toolUse.name} TIMED OUT after ${elapsedMs}ms — browser likely wedged ` +
+              `(e.g. a click triggered a navigation/reload that never settled). Finalizing as inconclusive.`,
+          );
+          return {
+            summary: 'Agent stalled — a browser action did not complete.',
+            stats: { total_actions: totalActions, input_tokens: inputTokens, output_tokens: outputTokens },
+            verdict: 'inconclusive',
+            reason:
+              `Browser action timed out after ${(elapsedMs / 1000).toFixed(0)}s at step ${step + 1}/${options.maxSteps}: ` +
+              `${lastActionLabel}. The page likely got stuck loading after this action.`,
+          };
+        }
+        logger.warn(`[${step + 1}] ${toolUse.name} failed after ${Date.now() - toolStart}ms: ${err}`);
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,
