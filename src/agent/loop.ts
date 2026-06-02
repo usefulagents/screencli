@@ -1,7 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { createHash } from 'node:crypto';
 import type { Page } from 'playwright';
-import { tools } from './tools.js';
-import { buildSystemPrompt } from './system-prompt.js';
 import { ToolHandlers } from './tool-handlers.js';
 import { EventLog } from '../recording/event-log.js';
 import { logger } from '../utils/logger.js';
@@ -49,20 +48,22 @@ export interface AgentLoopResult {
   reason?: string;
 }
 
-// Visual-verification keyword detector — when the prompt mentions visual
-// properties we keep the `screenshot` tool available. Otherwise we hide it,
-// because offering it tempts the model to call it for navigation flows that
-// don't need vision. Mirrors the same list in the cloud proxy.
-const VISUAL_KEYWORDS = [
-  'look', 'looks', 'color', 'colour', 'style', 'styled',
-  'appear', 'appears', 'appearance', 'visible', 'visual',
-  'design', 'layout', 'chart', 'graph', 'image', 'photo',
-  'icon', 'logo', 'font', 'shadow', 'render', 'rendered',
-  'screenshot', 'see', 'shown', 'displayed', 'background',
-];
-function promptNeedsVision(prompt: string): boolean {
-  const p = prompt.toLowerCase();
-  return VISUAL_KEYWORDS.some((kw) => p.includes(kw));
+// Stagnation detection thresholds. A "fingerprint" is a hash of the page
+// state (URL + element list) returned after a step's actions. If consecutive
+// steps produce the same fingerprint, the agent is acting without effect —
+// the classic failure mode where it guesses coordinates / re-opens the same
+// menu forever until it burns the whole step budget.
+const NUDGE_AFTER_NO_PROGRESS = 2;   // inject a course-correction message
+const BAIL_AFTER_NO_PROGRESS = 5;    // give up and return inconclusive
+const LOW_STEPS_REMAINING = 8;       // start telling the agent to converge
+
+function fingerprintToolResults(toolResults: Anthropic.ToolResultBlockParam[]): string {
+  const text = toolResults
+    .flatMap((r) => (Array.isArray(r.content) ? r.content : []))
+    .filter((b: any) => b.type === 'text')
+    .map((b: any) => b.text as string)
+    .join('\n');
+  return createHash('sha1').update(text).digest('hex');
 }
 
 // Strip old screenshots from conversation to keep payloads small.
@@ -108,8 +109,15 @@ function trimOldScreenshots(messages: Anthropic.MessageParam[], keepLast: number
 }
 
 export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoopResult> {
-  const useProxy = isLoggedIn() && !process.env['ANTHROPIC_API_KEY'];
-  const client = useProxy ? null : new Anthropic({ apiKey: options.apiKey });
+  // The CLI no longer ships its own system prompt or tool schema — the agent
+  // always runs through the cloud proxy, which is the single source of truth
+  // for the prompt, tool list, and model. (Local/BYO-key recordings are not
+  // supported.) So a valid login is required.
+  if (!isLoggedIn()) {
+    throw new AgentError(
+      'screencli must be logged in to run the agent. Run `npx screencli login` (or set SCREENCLI_TOKEN).',
+    );
+  }
   const handlers = new ToolHandlers(
     options.page,
     options.eventLog,
@@ -117,44 +125,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     options.actionDelayMs
   );
 
-  const systemPrompt = buildSystemPrompt(
-    options.url,
-    options.prompt,
-    options.requireVerdict,
-    options.authInstructions,
-  );
-
-  // In verdict mode, hide the `done` tool so the agent is forced to use
-  // pass/fail. The Anthropic SDK doesn't error on unknown tool names if the
-  // model tries to call one — we just rely on the tool list to constrain.
-  //
-  // Additionally, hide `screenshot` unless the prompt explicitly mentions
-  // visual properties. The element list is sufficient for navigation, and
-  // offering vision causes the model to call it speculatively, which is
-  // the main source of slowness users complain about.
-  const needsVision = promptNeedsVision(options.prompt);
-  let availableTools = options.requireVerdict
-    ? tools.filter((t) => t.name !== 'done')
-    : tools;
-  if (!needsVision) {
-    availableTools = availableTools.filter((t) => t.name !== 'screenshot');
-  }
-  // Prompt caching: within a single recording, system + tools are identical
-  // across every step. A single cache breakpoint on the last tool caches
-  // both — cutting input tokens for steps 2..N by ~80% and shaving latency.
-  // Cache TTL is 5 min, which comfortably covers a recording session.
-  const cachedTools = availableTools.map((t, i) =>
-    i === availableTools.length - 1
-      ? ({ ...t, cache_control: { type: 'ephemeral' as const } } as any)
-      : t,
-  );
-  const cachedSystem = [
-    { type: 'text' as const, text: systemPrompt, cache_control: { type: 'ephemeral' as const } },
-  ];
   const messages: Anthropic.MessageParam[] = [];
   let totalActions = 0;
   let inputTokens = 0;
   let outputTokens = 0;
+
+  // Stagnation tracking (see fingerprintToolResults).
+  let lastFingerprint: string | null = null;
+  let noProgressStreak = 0;
+  let lastActionLabel = '';
 
   // Initial observation: navigate to URL
   logger.info(`Navigating to ${options.url}`);
@@ -192,25 +171,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     const MAX_RETRIES = 3;
     for (let attempt = 0; ; attempt++) {
       try {
-        if (useProxy) {
-          response = await callAgentProxy({
-            messages: messages as any,
-            model: options.model,
-            recording_id: options.recording_id,
-            url: options.url,
-            prompt: options.prompt,
-            requireVerdict: options.requireVerdict,
-            authInstructions: options.authInstructions,
-          }) as any;
-        } else {
-          response = await client!.messages.create({
-            model: options.model,
-            max_tokens: 1024,
-            system: cachedSystem as any,
-            tools: cachedTools,
-            messages,
-          });
-        }
+        response = await callAgentProxy({
+          messages: messages as any,
+          model: options.model,
+          recording_id: options.recording_id,
+          url: options.url,
+          prompt: options.prompt,
+          requireVerdict: options.requireVerdict,
+          authInstructions: options.authInstructions,
+        }) as any;
         break;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -260,6 +229,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
         toolUse.name;
       options.onAction?.(step + 1, toolUse.name, String(description));
       logger.info(`[${step + 1}] ${toolUse.name}: ${description}`);
+      lastActionLabel = `${toolUse.name} (${String(description)})`;
 
       try {
         const result = await handlers.handle(toolUse.name, toolUse.input as Record<string, any>);
@@ -289,7 +259,59 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       }
     }
 
-    messages.push({ role: 'user', content: toolResults });
+    // ── Stagnation detection ──
+    // Compare the page state after this step to the previous step. If nothing
+    // changed, the agent's actions are having no effect — nudge it to change
+    // strategy, and bail out entirely if it keeps spinning. This is what stops
+    // the "re-open the same menu / guess coordinates" loop from eating the
+    // whole step budget and forcing a useless max-steps inconclusive.
+    const fingerprint = fingerprintToolResults(toolResults);
+    if (lastFingerprint !== null && fingerprint === lastFingerprint) {
+      noProgressStreak++;
+    } else {
+      noProgressStreak = 0;
+    }
+    lastFingerprint = fingerprint;
+
+    if (noProgressStreak >= BAIL_AFTER_NO_PROGRESS) {
+      logger.warn(`Agent stuck: ${noProgressStreak + 1} actions with no page change. Bailing.`);
+      return {
+        summary: 'Agent got stuck repeating actions with no effect.',
+        stats: { total_actions: totalActions, input_tokens: inputTokens, output_tokens: outputTokens },
+        verdict: 'inconclusive',
+        reason:
+          `Agent repeated actions with no page change ${noProgressStreak + 1} times and could not make progress` +
+          (lastActionLabel ? ` (last attempted: ${lastActionLabel})` : '') +
+          `. It likely couldn't reach a required element — e.g. a menu/submenu item that only appears after hovering the parent.`,
+      };
+    }
+
+    const userContent: Anthropic.ContentBlockParam[] = [...toolResults];
+
+    // Coaching note: budget awareness + stagnation course-correction. Appended
+    // after the tool_result blocks (which must come first in the user turn).
+    const stepsLeft = options.maxSteps - (step + 1);
+    const coachLines: string[] = [`[Progress] Step ${step + 1}/${options.maxSteps} — ${stepsLeft} left.`];
+    if (noProgressStreak >= NUDGE_AFTER_NO_PROGRESS) {
+      coachLines.push(
+        `The page has not changed for ${noProgressStreak + 1} actions — what you are doing is NOT working. Do not repeat it. ` +
+          `Reveal hidden items (hover a menu to open its submenu), open the parent first, scroll, or pick a different element by index. ` +
+          (options.requireVerdict
+            ? `If you cannot reach the state needed to judge the expectation, call fail() naming the exact blocker.`
+            : `If you cannot reach the next step, call done() and say what you could not reach.`),
+      );
+    }
+    if (stepsLeft <= LOW_STEPS_REMAINING) {
+      coachLines.push(
+        `You are low on steps — converge now and ` +
+          (options.requireVerdict ? `return a pass/fail verdict.` : `finish with done().`),
+      );
+    }
+    if (coachLines.length > 0) {
+      userContent.push({ type: 'text', text: coachLines.join(' ') });
+    }
+
+    messages.push({ role: 'user', content: userContent });
   }
 
   // ── maxSteps fallthrough ──

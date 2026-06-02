@@ -20,6 +20,7 @@ export interface ToolResult {
 
 export class ToolHandlers {
   private actionCount = 0;
+  private prevSignature: string | null = null;
 
   constructor(
     private page: Page,
@@ -28,10 +29,23 @@ export class ToolHandlers {
     private actionDelayMs: number
   ) {}
 
-  /** Return element list only (no vision — fast). Used by all action tools. */
-  private async elementsOnly(): Promise<ToolResult['content']> {
+  /**
+   * Return the current element list (no vision — fast) and tell the agent whether
+   * the action actually changed anything. `notes` are extra warnings (e.g. a
+   * coordinate click that landed on the wrong element) prepended to the result.
+   */
+  private async observe(notes: string[] = []): Promise<ToolResult['content']> {
     const { formatted } = await getInteractiveElements(this.page);
-    return [{ type: 'text', text: formatted }];
+    const signature = `${this.page.url()}\n${formatted}`;
+    const lines = [...notes];
+    if (this.prevSignature !== null && signature === this.prevSignature) {
+      lines.push(
+        'The URL and visible elements are identical to before your last action — it had no visible effect. Do not repeat it. Try revealing hidden items (hover the parent menu), scrolling, or a different element.'
+      );
+    }
+    this.prevSignature = signature;
+    const prefix = lines.length > 0 ? `[note] ${lines.join(' ')}\n\n` : '';
+    return [{ type: 'text', text: `${prefix}${formatted}` }];
   }
 
   async handle(toolName: string, input: Record<string, any>): Promise<ToolResult> {
@@ -154,7 +168,13 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    const notes: string[] = [];
+    if (result.coordinateHit !== undefined) {
+      notes.push(
+        `You clicked raw coordinates (${target.x}, ${target.y}), which hit ${result.coordinateHit}. Coordinate clicks are unreliable — prefer clicking by index.`
+      );
+    }
+    return { content: await this.observe(notes) };
   }
 
   private async handleType(input: Record<string, any>): Promise<ToolResult> {
@@ -172,7 +192,7 @@ export class ToolHandlers {
         value: input.text,
         url: this.page.url(),
       });
-      return { content: await this.elementsOnly() };
+      return { content: await this.observe() };
     }
 
     const result = await actions.type(
@@ -190,7 +210,7 @@ export class ToolHandlers {
       value: input.text,
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handlePressKey(input: Record<string, any>): Promise<ToolResult> {
@@ -202,7 +222,7 @@ export class ToolHandlers {
       value: input.key,
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleGoBack(input: Record<string, any>): Promise<ToolResult> {
@@ -213,7 +233,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleScroll(input: Record<string, any>): Promise<ToolResult> {
@@ -233,7 +253,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleHover(input: Record<string, any>): Promise<ToolResult> {
@@ -246,7 +266,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleNavigate(input: Record<string, any>): Promise<ToolResult> {
@@ -258,7 +278,7 @@ export class ToolHandlers {
       value: input.url,
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleWait(input: Record<string, any>): Promise<ToolResult> {
@@ -274,7 +294,7 @@ export class ToolHandlers {
       viewport: this.viewport(),
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleSelectOption(input: Record<string, any>): Promise<ToolResult> {
@@ -293,7 +313,7 @@ export class ToolHandlers {
       value: input.option_label ?? input.option_value,
       url: result.url,
     });
-    return { content: await this.elementsOnly() };
+    return { content: await this.observe() };
   }
 
   private async handleDone(input: Record<string, any>): Promise<ToolResult> {

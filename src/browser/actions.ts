@@ -6,6 +6,8 @@ export interface ActionResult {
   bounding_box?: BoundingBox;
   screenshot: Buffer;
   url: string;
+  /** For coordinate clicks: a short description of the element actually under (x, y). */
+  coordinateHit?: string;
 }
 
 /** Capture a JPEG screenshot (much smaller than PNG → faster API calls). */
@@ -22,6 +24,21 @@ export async function click(
 ): Promise<ActionResult> {
   // Coordinate-based click (fallback)
   if (target.x !== undefined && target.y !== undefined) {
+    // Report what is actually under the cursor — coordinate clicks routinely land
+    // on the wrong element, so surface this back to the agent.
+    const hitX = Number(target.x);
+    const hitY = Number(target.y);
+    const coordinateHit = (await page
+      .evaluate(`
+        (function() {
+          var el = document.elementFromPoint(${hitX}, ${hitY});
+          if (!el) return 'nothing (empty area)';
+          var tag = el.tagName.toLowerCase();
+          var label = (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60);
+          return label ? '<' + tag + '> "' + label + '"' : '<' + tag + '>';
+        })()
+      `)
+      .catch(() => undefined)) as string | undefined;
     if (clickType === 'double') {
       await page.mouse.dblclick(target.x, target.y);
     } else {
@@ -30,7 +47,7 @@ export async function click(
     const bounding_box = { x: target.x - 5, y: target.y - 5, width: 10, height: 10 };
     if (delayMs > 0) await page.waitForTimeout(delayMs);
     const state = await captureState(page);
-    return { bounding_box, ...state };
+    return { bounding_box, coordinateHit, ...state };
   }
 
   const locator = resolveLocator(page, target);
